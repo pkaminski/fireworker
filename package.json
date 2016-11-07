@@ -1,0 +1,32 @@
+{
+  "name": "fireworker",
+  "version": "0.1.0",
+  "description": "Firebase in web workers",
+  "scripts": {
+    "setup": "rm -rf bower_components; rm -rf node_modules; npm install; bower install;"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:pkaminski/fireworker.git"
+  },
+  "keywords": [
+    "firebase",
+    "worker",
+    "webworker"
+  ],
+  "author": "Piotr Kaminski",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/pkaminski/fireworker/issues"
+  },
+  "homepage": "https://github.com/pkaminski/fireworker",
+  "devDependencies": {
+    "buble": "^0.14.2",
+    "compose-source-map": "^1.0.0",
+    "grunt": "^1.0.0",
+    "grunt-contrib-clean": "^1.0.0",
+    "grunt-contrib-uglify": "^2.0.0",
+    "grunt-release": "^0.14.0",
+    "load-grunt-tasks": "^3.5.2"
+  }
+}
