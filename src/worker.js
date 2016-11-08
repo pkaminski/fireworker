@@ -27,13 +27,15 @@ class Fireworker {
     Fireworker._firstMessageReceived = true;
     let promise;
     try {
-      promise = Promise.resolve(this[event.data.msg](event.data));
+      const fn = this[event.data.msg];
+      if (!fn) throw new Error('Unknown message token: ' + event.data.msg);
+      promise = Promise.resolve(fn.call(this, event.data));
     } catch(e) {
       promise = Promise.reject(e);
     }
     promise.then(result => {
       this._send({msg: 'resolve', id: event.data.id, result: result});
-    }, function(error) {
+    }, error => {
       this._send({msg: 'reject', id: event.data.id, error: errorToJson(error)});
     });
   }
@@ -43,7 +45,10 @@ class Fireworker {
   }
 
   init() {
-    return Object.keys(Fireworker._exposed);
+    return {
+      exposedMethodNames: Object.keys(Fireworker._exposed),
+      firebaseSdkVersion: Firebase.SDK_VERSION
+    };
   }
 
   call({name, args}) {
@@ -80,6 +85,10 @@ class Fireworker {
     createRef(url).offAuth(authCallback);
   }
 
+  _onAuthCallback(callbackId, auth) {
+    this._send({msg: 'callback', id: callbackId, args: [auth]});
+  }
+
   set({url, value}) {
     return createRef(url).set(value);
   }
@@ -89,11 +98,14 @@ class Fireworker {
   }
 
   on({listenerKey, url, terms, eventType, callbackId, options}) {
+    options = options || {};
     options.orderChildren = false;
-    for (let term of terms) {
-      if (term[0] === 'orderByChild' || term[0] === 'orderByValue') {
-        options.orderChildren = true;
-        break;
+    if (terms) {
+      for (let term of terms) {
+        if (term[0] === 'orderByChild' || term[0] === 'orderByValue') {
+          options.orderChildren = true;
+          break;
+        }
       }
     }
     const snapshotCallback = this._callbacks[callbackId] =
@@ -125,24 +137,17 @@ class Fireworker {
   }
 
   _onSnapshotCallback(callbackId, options, snapshot) {
-    const value = options.omitValue ? undefined : snapshot.val();
-    const exists = snapshot.exists();
-    const hasChildren = snapshot.hasChildren();
-    let childrenKeys;
-    if (!options.omitValue && options.orderChildren && hasChildren) {
-      childrenKeys = [];
-      snapshot.forEach(child => {
-        for (let key in value) if (value[key] === child) childrenKeys.push(key);
-      });
-    }
-    this._send({msg: 'callback', id: callbackId, args: [
-      null, {url: snapshot.ref().toString(), childrenKeys, value, exists, hasChildren}
-    ]});
+    this._send({msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]});
   }
 
   _onCancelCallback(callbackId, error) {
     delete this._callbacks[callbackId];
     this._send({msg: 'callback', id: callbackId, args: [errorToJson(error)]});
+  }
+
+  once({url, terms, eventType, options}) {
+    return createRef(url, terms).once(eventType).then(
+      snapshot => snapshotToJson(snapshot, options));
   }
 
   static expose(fn) {
@@ -169,6 +174,23 @@ function errorToJson(error) {
   return json;
 }
 
+function snapshotToJson(snapshot, options) {
+  const value = options.omitValue ? undefined : snapshot.val();
+  const exists = snapshot.exists();
+  const hasChildren = snapshot.hasChildren();
+  let childrenKeys;
+  if (!options.omitValue && options.orderChildren && hasChildren) {
+    for (let key in value) {
+      if (!value.hasOwnProperty(key)) continue;
+      // Non-enumerable properties won't be transmitted when sending.
+      Object.defineProperty(value[key], '$key', {value: key});
+    }
+    childrenKeys = [];
+    snapshot.forEach(child => {childrenKeys.push(child.$key);});
+  }
+  return {url: snapshot.ref().toString(), childrenKeys, value, exists, hasChildren};
+}
+
 function createRef(url, terms) {
   let ref = new Firebase(url);
   if (terms) {
@@ -190,6 +212,7 @@ function acceptConnections() {
 }
 
 self.Fireworker = Fireworker;
+self.window = self;
 acceptConnections();
 
 })();

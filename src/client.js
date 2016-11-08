@@ -27,6 +27,10 @@ class Snapshot {
     return this._value;
   }
 
+  exportVal() {
+    return this.val();
+  }
+
   child(childPath) {
     const childPathParts = childPath.split('/');
     const child = this._getChildValue(childPathParts);
@@ -83,7 +87,8 @@ class Snapshot {
   }
 
   key() {
-    return this._url.replace(/.*\//, '');
+    if (this._key === undefined) this._key = this._url.replace(/.*\//, '');
+    return this._key;
   }
 
   numChildren() {
@@ -119,15 +124,15 @@ class Query {
     this._terms = terms;
   }
 
-  on(eventType, callback, cancelCallback, context, options) {
-    // options = {omitValue: boolean}
-    if (context === 'undefined' && typeof cancelCallback !== 'function') {
+  on(eventType, callback, cancelCallback, context) {
+    if (typeof context === 'undefined' && typeof cancelCallback !== 'function') {
       context = cancelCallback;
       cancelCallback = undefined;
     }
     worker.on(
       this.toString(), this._url, this._terms, eventType, callback, cancelCallback, context,
-      options);
+      {omitValue: !!callback.omitSnapshotValue}
+    );
     return callback;
   }
 
@@ -141,7 +146,8 @@ class Query {
       failureCallback = undefined;
     }
     return worker.once(
-      this._url, this._terms, eventType, successCallback, failureCallback, context);
+      this._url, this._terms, eventType, successCallback, failureCallback, context,
+      {omitValue: !!(successCallback && successCallback.omitSnapshotValue)});
   }
 
   ref() {
@@ -154,7 +160,8 @@ class Query {
       const queryTerms = this._terms.map(term => {
         let queryTerm = term[0];
         if (term.length > 1) {
-          queryTerm += '=' + encodeURIComponent(term.slice(1).join(','));
+          queryTerm +=
+            '=' + encodeURIComponent(term.slice(1).map(x => JSON.stringify(x)).join(','));
         }
         return queryTerm;
       });
@@ -183,6 +190,7 @@ class Query {
 class Firebase extends Query {
 // jshint latedef:nofunc
   constructor(url) {
+    // TODO: support additional undocumented "environment" argument
     super(url);
     worker.trackServer(this.root()._url);
   }
@@ -288,6 +296,7 @@ class Firebase extends Query {
   static connectWorker(webWorker) {
     if (worker) throw new Error('Worker already connected');
     worker = new FirebaseWorker(webWorker);
+    return worker._ready;
   }
 
   static goOnline() {
@@ -312,8 +321,11 @@ class FirebaseWorker {
     this._servers = {};
     this._callbacks = {};
     this._port = webWorker.port || webWorker;
-    this._port.onmessage = this.receive.bind(this);
-    this._send({msg: 'init'}).then(exposedMethodNames => {
+    this._shared = !!webWorker.port;
+    this._port.onmessage = this._receive.bind(this);
+    this._ready = this._send({msg: 'init'}).then(({exposedMethodNames, firebaseSdkVersion}) => {
+      Firebase.SDK_VERSION =
+        `${firebaseSdkVersion} (over ${this._shared ? 'shared ' : ''}fireworker)`;
       const worker = window.Firebase.worker = {};
       for (let name of exposedMethodNames) {
         worker[name] = this._bindExposedFunction(name);
@@ -323,6 +335,7 @@ class FirebaseWorker {
   }
 
   _send(message) {
+    // console.log('send', message);
     message.id = ++this._idCounter;
     const promise = new Promise((resolve, reject) => {
       this._deferreds[message.id] = {resolve, reject};
@@ -333,6 +346,7 @@ class FirebaseWorker {
   }
 
   _receive(event) {
+    // console.log('receive', event.data);
     this[event.data.msg](event.data);
   }
 
@@ -362,9 +376,8 @@ class FirebaseWorker {
       offset: 0, lastUniqueKeyTime: 0, lastRandomValues: [], authListeners: []
     };
     const authCallbackId = this._registerCallback(this._authCallback.bind(this, server));
-    this.on(`${rootUrl}/.info/serverTimeOffset`, {}, 'value', offset => {
-      server.offset = offset;
-    });
+    const offsetUrl = `${rootUrl}/.info/serverTimeOffset`;
+    this.on(offsetUrl, offsetUrl, [], 'value', offset => {server.offset = offset;});
     this._send({msg: 'onAuth', url: rootUrl, callbackId: authCallbackId});
   }
 
@@ -412,7 +425,7 @@ class FirebaseWorker {
     listener.callback = callback;
     listener.context = context;
     this._servers[rootUrl].authListeners.push(listener);
-    listener(this.getAuth());
+    listener(this.getAuth(rootUrl));
   }
 
   offAuth(rootUrl, callback, context) {
@@ -452,7 +465,7 @@ class FirebaseWorker {
   on(listenerKey, url, terms, eventType, snapshotCallback, cancelCallback, context, options) {
     const handle = {listenerKey, eventType, snapshotCallback, cancelCallback, context};
     const callback = this._onCallback.bind(this, handle);
-    handle.id = this._registerCallback(callback);
+    this._registerCallback(callback, handle);
     // Keep multiple IDs to allow the same snapshotCallback to be reused.
     snapshotCallback.__callbackIds = snapshotCallback.__callbackIds || [];
     snapshotCallback.__callbackIds.push(handle.id);
@@ -486,6 +499,7 @@ class FirebaseWorker {
           i += 1;
         }
       }
+      if (!callbackId) return;  // no-op, callback never registered or already deregistered
     } else {
       for (let id of Object.keys(this._callbacks)) {
         const handle = this._callbacks[id];
@@ -503,29 +517,42 @@ class FirebaseWorker {
     });
   }
 
-  _onCallback(handle, error, snapshotOptions) {
+  _onCallback(handle, error, snapshotJson) {
     if (error) {
       this._deregisterCallback(handle.id);
       if (handle.cancelCallback) handle.cancelCallback.call(handle.context, errorFromJson(error));
     } else {
-      handle.snapshotCallback(new Snapshot(snapshotOptions));
+      handle.snapshotCallback.call(handle.context, new Snapshot(snapshotJson));
     }
   }
 
-  callback({id, args}) {
-    const callback = this._callbacks[id];
-    if (!callback) throw new Error('Unregistered callback: ' + id);
-    callback.apply(null, args);
+  once(url, terms, eventType, successCallback, failureCallback, context, options) {
+    return this._send({msg: 'once', url, terms, eventType, options}).then(snapshotJson => {
+      const snapshot = new Snapshot(snapshotJson);
+      if (successCallback) successCallback.call(context, snapshot);
+      return snapshot;
+    }, error => {
+      if (failureCallback) failureCallback.call(context, error);
+      return Promise.reject(error);
+    });
   }
 
-  _registerCallback(callback) {
-    const id = 'c' + (++this._idCounter);
-    this._callbacks[id] = callback;
-    return id;
+  callback({id, args}) {
+    const handle = this._callbacks[id];
+    if (!handle) throw new Error('Unregistered callback: ' + id);
+    handle.callback.apply(null, args);
+  }
+
+  _registerCallback(callback, handle) {
+    handle = handle || {};
+    handle.callback = callback;
+    handle.id = 'c' + (++this._idCounter);
+    this._callbacks[handle.id] = handle;
+    return handle.id;
   }
 
   _nullifyCallback(id) {
-    this._callbacks[id] = noop;
+    this._callbacks[id].callback = noop;
   }
 
   _deregisterCallback(id) {
@@ -536,11 +563,12 @@ class FirebaseWorker {
 
 function attachCallback(promise, onComplete) {
   if (!onComplete) return promise;
-  return promise.then(result => {onComplete(result);}, error => {onComplete(error);});
+  return promise.then(result => {onComplete(null, result);}, error => {onComplete(error);});
 }
 
 function errorFromJson(json) {
   if (!json || json instanceof Error) return json;
+  console.log(json);
   const error = new Error();
   for (let propertyName in json) {
     if (!json.hasOwnProperty(propertyName)) continue;

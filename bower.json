@@ -16,8 +16,5 @@
     "**/.*",
     "node_modules",
     "bower_components"
-  ],
-  "dependencies": {
-    "firebase": "2.4.x"
-  }
+  ]
 }
