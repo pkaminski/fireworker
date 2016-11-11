@@ -1,7 +1,7 @@
 (function() {
 'use strict';
 
-/* globals Firebase, self */
+/* globals Firebase, CryptoJS, setImmediate, self */
 
 // TODO: emulate localStorage via indexedDB and communication with client
 // TODO: scan fireworkers regularly and destroy any that haven't been pinged in a while
@@ -11,6 +11,8 @@ class Fireworker {
   constructor(port) {
     this._port = port;
     this._callbacks = {};
+    this._messages = [];
+    this._flushMessageQueue = this._flushMessageQueue.bind(this);
     port.onmessage = this._receive.bind(this);
   }
 
@@ -25,23 +27,33 @@ class Fireworker {
 
   _receive(event) {
     Fireworker._firstMessageReceived = true;
+    for (let message of event.data) this._receiveMessage(message);
+  }
+
+  _receiveMessage(message) {
     let promise;
     try {
-      const fn = this[event.data.msg];
-      if (!fn) throw new Error('Unknown message token: ' + event.data.msg);
-      promise = Promise.resolve(fn.call(this, event.data));
+      const fn = this[message.msg];
+      if (!fn) throw new Error('Unknown message token: ' + message.msg);
+      promise = Promise.resolve(fn.call(this, message));
     } catch(e) {
       promise = Promise.reject(e);
     }
     promise.then(result => {
-      this._send({msg: 'resolve', id: event.data.id, result: result});
+      this._send({msg: 'resolve', id: message.id, result: result});
     }, error => {
-      this._send({msg: 'reject', id: event.data.id, error: errorToJson(error)});
+      this._send({msg: 'reject', id: message.id, error: errorToJson(error)});
     });
   }
 
   _send(message) {
-    this._port.postMessage(message);
+    if (!this._messages.length) setImmediate(this._flushMessageQueue);
+    this._messages.push(message);
+  }
+
+  _flushMessageQueue() {
+    this._port.postMessage(this._messages);
+    this._messages = [];
   }
 
   init() {
@@ -150,6 +162,34 @@ class Fireworker {
       snapshot => snapshotToJson(snapshot, options));
   }
 
+  transaction({url, oldHash, newValue, options}) {
+    const ref = createRef(url);
+    let stale, currentValue, currentHash;
+
+    return ref.transaction(value => {
+      currentValue = value;
+      currentHash = hashJson(value);
+      stale = oldHash !== currentHash;
+      if (stale) return;
+      if (newValue === undefined && options.safeAbort) return value;
+      return newValue;
+    }, undefined, options.applyLocally).then(result => {
+      if (stale) {
+        return {stale, value: currentValue, hash: currentHash};
+      } else {
+        return {
+          stale: false, committed: result.committed, snapshotJson: snapshotToJson(result.snapshot)
+        };
+      }
+    }, error => {
+      if (options.nonsequential && error.message === 'set') {
+        return ref.once('value').then(
+          value => ({stale: true, value: value, hash: hashJson(value)}));
+      }
+      return Promise.reject(error);
+    });
+  }
+
   static expose(fn) {
     if (Fireworker._exposed.hasOwnProperty(fn.name)) {
       throw new Error(`Function ${fn.name}() already exposed`);
@@ -175,28 +215,75 @@ function errorToJson(error) {
 }
 
 function snapshotToJson(snapshot, options) {
-  const value = options.omitValue ? undefined : snapshot.val();
-  const exists = snapshot.exists();
-  const hasChildren = snapshot.hasChildren();
-  let childrenKeys;
-  if (!options.omitValue && options.orderChildren && hasChildren) {
-    for (let key in value) {
-      if (!value.hasOwnProperty(key)) continue;
-      // Non-enumerable properties won't be transmitted when sending.
-      Object.defineProperty(value[key], '$key', {value: key});
+  const url = snapshot.ref().toString();
+  if (options && options.omitValue) {
+    return {url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren()};
+  } else {
+    const value = snapshot.val();
+    let childrenKeys;
+    if (options && options.orderChildren && typeof value === 'object') {
+      for (let key in value) {
+        if (!value.hasOwnProperty(key)) continue;
+        // Non-enumerable properties won't be transmitted when sending.
+        Object.defineProperty(value[key], '$key', {value: key});
+      }
+      childrenKeys = [];
+      snapshot.forEach(child => {childrenKeys.push(child.$key);});
     }
-    childrenKeys = [];
-    snapshot.forEach(child => {childrenKeys.push(child.$key);});
+    return {url, value, childrenKeys};
   }
-  return {url: snapshot.ref().toString(), childrenKeys, value, exists, hasChildren};
 }
 
 function createRef(url, terms) {
-  let ref = new Firebase(url);
-  if (terms) {
-    for (let term of terms) ref = ref[term[0]].apply(ref, term.slice(1));
+  try {
+    let ref = new Firebase(url);
+    if (terms) {
+      for (let term of terms) ref = ref[term[0]].apply(ref, term.slice(1));
+    }
+    return ref;
+  } catch (e) {
+    console.error(url, terms, e);
+    throw e;
   }
-  return ref;
+}
+
+function hashJson(json) {
+  if (json === null) return null;
+  const sha1 = CryptoJS.algo.SHA1.create();
+  _hashJson(json, sha1);
+  return 'sha1:' + sha1.finalize().toString();
+}
+
+function _hashJson(json, sha1) {
+  let type = typeof json;
+  if (type === 'object') {
+    if (json === null) type = 'null';
+    else if (Array.isArray(json)) type = 'array';
+    else if (json instanceof Boolean) type = 'boolean';
+    else if (json instanceof Number) type = 'number';
+    else if (json instanceof String) type = 'string';
+  }
+  switch (type) {
+    case 'undefined': sha1.update('u'); break;
+    case 'null': sha1.update('n'); break;
+    case 'boolean': sha1.update(json ? 't' : 'f'); break;
+    case 'number': sha1.update('x' + json); break;
+    case 'string': sha1.update('s' + json); break;
+    case 'array':
+      sha1.update('[');
+      for (let i = 0; i < json.length; i++) _hashJson(json[i], sha1);
+      sha1.update(']');
+      break;
+    case 'object':
+      sha1.update('{');
+      const keys = Object.keys(json);
+      keys.sort();
+      for (let i = 0; i < keys.length; i++) _hashJson(json[keys[i]], sha1);
+      sha1.update('}');
+      break;
+    default:
+      throw new Error('Unable to hash non-JSON data: ' + type);
+  }
 }
 
 const fireworkers = [];

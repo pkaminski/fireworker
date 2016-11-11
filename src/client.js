@@ -1,7 +1,7 @@
 (function() {
 'use strict';
 
-/* globals window */
+/* globals window, setImmediate */
 
 let worker;
 
@@ -14,8 +14,8 @@ class Snapshot {
     this._url = url.replace(/\/$/, '');
     this._childrenKeys = childrenKeys;
     this._value = value;
-    this._exists = exists;
-    this._hasChildren = hasChildren;
+    this._exists = value === undefined ? exists || false : value !== null;
+    this._hasChildren = typeof value === 'object' || hasChildren || false;
   }
 
   exists() {
@@ -281,7 +281,7 @@ class Firebase extends Query {
   push(value, onComplete) {
     const child = this.child(worker.generateUniqueKey(this.root()));
     if (!value) return child;
-    const promise = attachCallback(worker.set(child, value), onComplete);
+    const promise = child.set(value, onComplete);
     child.then = promise.then.bind(promise);
     child.catch = promise.catch.bind(promise);
     if (promise.finally) child.finally = promise.finally.bind(promise);
@@ -289,8 +289,22 @@ class Firebase extends Query {
   }
 
   transaction(updateFunction, onComplete, applyLocally) {
-    // TODO: implement
-    throw new Error('Not implemented');
+    const options = {
+      applyLocally: applyLocally === undefined ? updateFunction.applyLocally : applyLocally
+    };
+    ['nonsequential', 'safeAbort'].forEach(key => options[key] = updateFunction[key]);
+    for (let key in options) {
+      if (options.hasOwnProperty(key) && options[key] === undefined) {
+        options[key] = Firebase.DefaultTransactionOptions[key];
+      }
+    }
+    return worker.transaction(this._url, updateFunction, options).then(result => {
+      if (onComplete) onComplete(null, result.committed, result.snapshot);
+      return result;
+    }, error => {
+      if (onComplete) onComplete(error);
+      return Promise.reject(error);
+    });
   }
 
   static connectWorker(webWorker) {
@@ -309,6 +323,10 @@ class Firebase extends Query {
 }
 
 Firebase.ServerValue = Object.freeze({TIMESTAMP: Object.freeze({'.sv': 'timestamp'})});
+Firebase.DefaultTransactionOptions = Object.seal({
+  applyLocally: true, nonsequential: false, safeAbort: false
+});
+Firebase.ABORT_TRANSACTION_NOW = Object.create(null);
 
 
 // jshint latedef:false
@@ -320,6 +338,8 @@ class FirebaseWorker {
     this._online = true;
     this._servers = {};
     this._callbacks = {};
+    this._messages = [];
+    this._flushMessageQueue = this._flushMessageQueue.bind(this);
     this._port = webWorker.port || webWorker;
     this._shared = !!webWorker.port;
     this._port.onmessage = this._receive.bind(this);
@@ -335,19 +355,25 @@ class FirebaseWorker {
   }
 
   _send(message) {
-    // console.log('send', message);
     message.id = ++this._idCounter;
     const promise = new Promise((resolve, reject) => {
       this._deferreds[message.id] = {resolve, reject};
     });
     this._deferreds[message.id].promise = promise;
-    this._port.postMessage(message);
+    if (!this._messages.length) setImmediate(this._flushMessageQueue);
+    this._messages.push(message);
     return promise;
+  }
+
+  _flushMessageQueue() {
+    // console.log('send', this._messages);
+    this._port.postMessage(this._messages);
+    this._messages = [];
   }
 
   _receive(event) {
     // console.log('receive', event.data);
-    this[event.data.msg](event.data);
+    for (let message of event.data) this[message.msg](message);
   }
 
   _bindExposedFunction(name) {
@@ -377,7 +403,7 @@ class FirebaseWorker {
     };
     const authCallbackId = this._registerCallback(this._authCallback.bind(this, server));
     const offsetUrl = `${rootUrl}/.info/serverTimeOffset`;
-    this.on(offsetUrl, offsetUrl, [], 'value', offset => {server.offset = offset;});
+    this.on(offsetUrl, offsetUrl, [], 'value', offset => {server.offset = offset.val();});
     this._send({msg: 'onAuth', url: rootUrl, callbackId: authCallbackId});
   }
 
@@ -391,8 +417,9 @@ class FirebaseWorker {
     let prefix = now;
     for (let i = 7; i >= 0; i--) {
       chars[i] = ALPHABET.charAt(prefix & 0x3f);
-      prefix >>>= 6;
+      prefix = Math.floor(prefix / 64);
     }
+    console.log('generateUniqueKey', now, chars);
     if (now === server.lastUniqueKeyTime) {
       let i = 11;
       while (i >= 0 && server.lastRandomValues[i] === 63) {
@@ -537,6 +564,33 @@ class FirebaseWorker {
     });
   }
 
+  transaction(url, updateFunction, options) {
+    let tries = 0;
+
+    const attemptTransaction = (oldValue, oldHash) => {
+      if (tries++ >= 25) return Promise.reject(new Error('maxretry'));
+      let newValue;
+      try {
+        newValue = updateFunction(oldValue);
+      } catch (e) {
+        return Promise.reject(e);
+      }
+      if (newValue === Firebase.ABORT_TRANSACTION_NOW ||
+          newValue === undefined && !options.safeAbort) {
+        return {committed: false, snapshot: new Snapshot({url, value: oldValue})};
+      }
+      return this._send({msg: 'transaction', url, oldHash, newValue, options}).then(result => {
+        if (result.stale) {
+          return attemptTransaction(result.value, result.hash);
+        } else {
+          return {committed: result.committed, snapshot: new Snapshot(result.snapshotJson)};
+        }
+      });
+    };
+
+    return attemptTransaction(null, null);
+  }
+
   callback({id, args}) {
     const handle = this._callbacks[id];
     if (!handle) throw new Error('Unregistered callback: ' + id);
@@ -546,7 +600,7 @@ class FirebaseWorker {
   _registerCallback(callback, handle) {
     handle = handle || {};
     handle.callback = callback;
-    handle.id = 'c' + (++this._idCounter);
+    handle.id = `cb${++this._idCounter}`;
     this._callbacks[handle.id] = handle;
     return handle.id;
   }
@@ -580,6 +634,7 @@ function errorFromJson(json) {
 function noop() {}
 
 // TODO: hook unload to remove all listeners
+// TODO: support array normalization, including in transaction input values
 
 window.Firebase = Firebase;
 })();
