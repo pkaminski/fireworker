@@ -1,7 +1,7 @@
 (function() {
 'use strict';
 
-/* globals window, setImmediate */
+/* globals window, setImmediate, setInterval */
 
 let worker;
 
@@ -298,11 +298,29 @@ class Firebase extends Query {
         options[key] = Firebase.DefaultTransactionOptions[key];
       }
     }
+
+    let onCompleteCalled = !!onComplete;
+    // Hold the ref value live until transaction complete, otherwise it'll keep retrying on a null
+    // value.
+    this.on('value', noop, error => {
+      if (!onCompleteCalled) {
+        onCompleteCalled = true;
+        onComplete(error);
+      }
+    });
     return worker.transaction(this._url, updateFunction, options).then(result => {
-      if (onComplete) onComplete(null, result.committed, result.snapshot);
+      this.off('value', noop);
+      if (!onCompleteCalled) {
+        onCompleteCalled = true;
+        onComplete(null, result.committed, result.snapshot);
+      }
       return result;
     }, error => {
-      if (onComplete) onComplete(error);
+      this.off('value', noop);
+      if (!onCompleteCalled) {
+        onCompleteCalled = true;
+        onComplete(error);
+      }
       return Promise.reject(error);
     });
   }
@@ -343,7 +361,29 @@ class FirebaseWorker {
     this._port = webWorker.port || webWorker;
     this._shared = !!webWorker.port;
     this._port.onmessage = this._receive.bind(this);
-    this._ready = this._send({msg: 'init'}).then(({exposedMethodNames, firebaseSdkVersion}) => {
+    this._initStorageItems();
+    this._connect();
+    window.addEventListener('unload', () => {this._send({msg: 'destroy'});});
+    setInterval(() => {this._send({msg: 'ping'});}, 60 * 1000);
+  }
+
+  _initStorageItems() {
+    try {
+      const storage = window.localStorage || window.sessionStorage;
+      if (!storage) return;
+      const items = [];
+      for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        items.push({key, value: storage.getItem(key)});
+      }
+      this._send({msg: 'init', storage: items});
+    } catch (e) {
+      // Some browsers don't like us accessing local storage -- nothing we can do.
+    }
+  }
+
+  _connect() {
+    this._ready = this._send({msg: 'connect'}).then(({exposedMethodNames, firebaseSdkVersion}) => {
       Firebase.SDK_VERSION =
         `${firebaseSdkVersion} (over ${this._shared ? 'shared ' : ''}fireworker)`;
       const worker = window.Firebase.worker = {};
@@ -351,7 +391,6 @@ class FirebaseWorker {
         worker[name] = this._bindExposedFunction(name);
       }
     });
-    // TODO: ping
   }
 
   _send(message) {
@@ -373,7 +412,11 @@ class FirebaseWorker {
 
   _receive(event) {
     // console.log('receive', event.data);
-    for (let message of event.data) this[message.msg](message);
+    for (let message of event.data) {
+      const fn = this[message.msg];
+      if (typeof fn !== 'function') throw new Error('Unknown message: ' + message.msg);
+      fn.call(this, message);
+    }
   }
 
   _bindExposedFunction(name) {
@@ -394,6 +437,22 @@ class FirebaseWorker {
     if (!deferred) throw new Error('fireworker received rejection of inexistent call');
     delete this._deferreds[message.id];
     deferred.reject(errorFromJson(message.error));
+  }
+
+  updateLocalStorage(items) {
+    try {
+      const storage = window.localStorage || window.sessionStorage;
+      for (let item in items) {
+        if (item.value === null) {
+          storage.removeItem(item.key);
+        } else {
+          storage.setItem(item.key, item.value);
+        }
+      }
+    } catch (e) {
+      // If we're denied access, there's nothing we can do.
+      console.log(e);
+    }
   }
 
   trackServer(rootUrl) {
@@ -419,7 +478,6 @@ class FirebaseWorker {
       chars[i] = ALPHABET.charAt(prefix & 0x3f);
       prefix = Math.floor(prefix / 64);
     }
-    console.log('generateUniqueKey', now, chars);
     if (now === server.lastUniqueKeyTime) {
       let i = 11;
       while (i >= 0 && server.lastRandomValues[i] === 63) {
@@ -632,9 +690,7 @@ function errorFromJson(json) {
 }
 
 function noop() {}
-
-// TODO: hook unload to remove all listeners
-// TODO: support array normalization, including in transaction input values
+noop.skipCallback = true;
 
 window.Firebase = Firebase;
 })();

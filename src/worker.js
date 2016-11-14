@@ -1,19 +1,100 @@
 (function() {
 'use strict';
 
-/* globals Firebase, CryptoJS, setImmediate, self */
+/* globals Firebase, CryptoJS, setImmediate, setInterval, self */
 
-// TODO: emulate localStorage via indexedDB and communication with client
-// TODO: scan fireworkers regularly and destroy any that haven't been pinged in a while
+const fireworkers = [];
+
+
+class LocalStorage {
+  constructor() {
+    this._items = [];
+    this._pendingItems = [];
+    this._initialized = false;
+    this._flushPending = this.flushPending.bind(this);
+  }
+
+  init(items) {
+    if (!this._initialized) {
+      this._items = items;
+      this._initialized = true;
+    }
+  }
+
+  _update(item) {
+    if (!this._pendingItems.length) setImmediate(this._flushPending);
+    this._pendingItems.push(item);
+  }
+
+  flushPending() {
+    if (!fireworkers.length) return;
+    fireworkers[0]._send({msg: 'updateLocalStorage', items: this._pendingItems});
+    this._pendingItems = [];
+  }
+
+  get length() {return this._items.length;}
+
+  key(n) {
+    return this._items[n].key;
+  }
+
+  getItem(key) {
+    for (let item of this._items) {
+      if (item.key === key) return item.value;
+    }
+    return null;
+  }
+
+  setItem(key, value) {
+    let targetItem;
+    for (let item of this._items) {
+      if (item.key === key) {
+        targetItem = item;
+        item.value = value;
+        break;
+      }
+    }
+    if (!targetItem) {
+      targetItem = {key, value};
+      this._items.push(targetItem);
+    }
+    this._update(targetItem);
+  }
+
+  removeItem(key) {
+    for (let i = 0; i < this._items.length; i++) {
+      if (this._items[i].key === key) {
+        this._items.splice(i, 1);
+        this._update({key, value: null});
+        break;
+      }
+    }
+  }
+
+  clear() {
+    for (let item in this._items) {
+      this._update({key: item.key, value: null});
+    }
+    this._items = [];
+  }
+}
+
+self.localStorage = new LocalStorage();
 
 
 class Fireworker {
   constructor(port) {
+    this.ping();
     this._port = port;
     this._callbacks = {};
     this._messages = [];
     this._flushMessageQueue = this._flushMessageQueue.bind(this);
     port.onmessage = this._receive.bind(this);
+  }
+
+  init({storage, url}) {
+    if (storage) self.localStorage.init(storage);
+    if (url) new Firebase(url);
   }
 
   destroy() {
@@ -23,10 +104,18 @@ class Fireworker {
     }
     this._callbacks = {};
     this._port.onmessage = null;
+    this._messages = [];
+    const k = fireworkers.indexOf(this);
+    if (k >= 0) fireworkers[k] = null;
+  }
+
+  ping() {
+    this.lastTouched = Date.now();
   }
 
   _receive(event) {
     Fireworker._firstMessageReceived = true;
+    this.lastTouched = Date.now();
     for (let message of event.data) this._receiveMessage(message);
   }
 
@@ -34,16 +123,18 @@ class Fireworker {
     let promise;
     try {
       const fn = this[message.msg];
-      if (!fn) throw new Error('Unknown message token: ' + message.msg);
+      if (typeof fn !== 'function') throw new Error('Unknown message: ' + message.msg);
       promise = Promise.resolve(fn.call(this, message));
     } catch(e) {
       promise = Promise.reject(e);
     }
-    promise.then(result => {
-      this._send({msg: 'resolve', id: message.id, result: result});
-    }, error => {
-      this._send({msg: 'reject', id: message.id, error: errorToJson(error)});
-    });
+    if (!message.oneWay) {
+      promise.then(result => {
+        this._send({msg: 'resolve', id: message.id, result: result});
+      }, error => {
+        this._send({msg: 'reject', id: message.id, error: errorToJson(error)});
+      });
+    }
   }
 
   _send(message) {
@@ -56,7 +147,7 @@ class Fireworker {
     this._messages = [];
   }
 
-  init() {
+  connect() {
     return {
       exposedMethodNames: Object.keys(Fireworker._exposed),
       firebaseSdkVersion: Firebase.SDK_VERSION
@@ -83,7 +174,7 @@ class Fireworker {
     return createRef(url).authWithOAuthToken(provider, credentials, options);
   }
 
-  unauth(url) {
+  unauth({url}) {
     return createRef(url).unauth();
   }
 
@@ -286,8 +377,6 @@ function _hashJson(json, sha1) {
   }
 }
 
-const fireworkers = [];
-
 function acceptConnections() {
   if (typeof onconnect !== 'undefined') {
     self.onconnect = function(event) {
@@ -296,7 +385,22 @@ function acceptConnections() {
   } else {
     fireworkers.push(new Fireworker(self));
   }
+  localStorage.flushPending();
 }
+
+const CONNECTION_CHECK_INTERVAL = 60 * 1000;
+let lastConnectionCheck = Date.now();
+setInterval(function findAbandonedConnections() {
+  const now = Date.now(), gap = now - lastConnectionCheck - CONNECTION_CHECK_INTERVAL;
+  lastConnectionCheck = now;
+  fireworkers.forEach(worker => {
+    if (!worker) return;
+    if (gap >= 1000 && worker.lastTouched <= now - gap) worker.lastTouched += gap;
+    if (now - worker.lastTouched >= 3 * CONNECTION_CHECK_INTERVAL) worker.destroy();
+  });
+  let k;
+  while ((k = fireworkers.indexOf(null)) >= 0) fireworkers.splice(k, 1);
+}, CONNECTION_CHECK_INTERVAL);
 
 self.Fireworker = Fireworker;
 self.window = self;
