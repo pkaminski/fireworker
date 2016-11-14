@@ -1,16 +1,112 @@
 (function() {
 'use strict';
 
-/* globals Firebase, self */
+/* globals Firebase, CryptoJS, setImmediate, setInterval, self */
 
-// TODO: emulate localStorage via indexedDB and communication with client
-// TODO: scan fireworkers regularly and destroy any that haven't been pinged in a while
+var fireworkers = [];
+
+
+var LocalStorage = function LocalStorage() {
+  this._items = [];
+  this._pendingItems = [];
+  this._initialized = false;
+  this._flushPending = this.flushPending.bind(this);
+};
+
+var prototypeAccessors = { length: {} };
+
+LocalStorage.prototype.init = function init (items) {
+  if (!this._initialized) {
+    this._items = items;
+    this._initialized = true;
+  }
+};
+
+LocalStorage.prototype._update = function _update (item) {
+  if (!this._pendingItems.length) { setImmediate(this._flushPending); }
+  this._pendingItems.push(item);
+};
+
+LocalStorage.prototype.flushPending = function flushPending () {
+  if (!fireworkers.length) { return; }
+  fireworkers[0]._send({msg: 'updateLocalStorage', items: this._pendingItems});
+  this._pendingItems = [];
+};
+
+prototypeAccessors.length.get = function () {return this._items.length;};
+
+LocalStorage.prototype.key = function key (n) {
+  return this._items[n].key;
+};
+
+LocalStorage.prototype.getItem = function getItem (key) {
+  for (var i = 0, list = this._items; i < list.length; i += 1) {
+    var item = list[i];
+
+      if (item.key === key) { return item.value; }
+  }
+  return null;
+};
+
+LocalStorage.prototype.setItem = function setItem (key, value) {
+  var targetItem;
+  for (var i = 0, list = this._items; i < list.length; i += 1) {
+    var item = list[i];
+
+      if (item.key === key) {
+      targetItem = item;
+      item.value = value;
+      break;
+    }
+  }
+  if (!targetItem) {
+    targetItem = {key: key, value: value};
+    this._items.push(targetItem);
+  }
+  this._update(targetItem);
+};
+
+LocalStorage.prototype.removeItem = function removeItem (key) {
+    var this$1 = this;
+
+  for (var i = 0; i < this._items.length; i++) {
+    if (this$1._items[i].key === key) {
+      this$1._items.splice(i, 1);
+      this$1._update({key: key, value: null});
+      break;
+    }
+  }
+};
+
+LocalStorage.prototype.clear = function clear () {
+    var this$1 = this;
+
+  for (var item in this._items) {
+    this$1._update({key: item.key, value: null});
+  }
+  this._items = [];
+};
+
+Object.defineProperties( LocalStorage.prototype, prototypeAccessors );
+
+self.localStorage = new LocalStorage();
 
 
 var Fireworker = function Fireworker(port) {
+  this.ping();
   this._port = port;
   this._callbacks = {};
+  this._messages = [];
+  this._flushMessageQueue = this._flushMessageQueue.bind(this);
   port.onmessage = this._receive.bind(this);
+};
+
+Fireworker.prototype.init = function init (ref) {
+    var storage = ref.storage;
+    var url = ref.url;
+
+  if (storage) { self.localStorage.init(storage); }
+  if (url) { new Firebase(url); }
 };
 
 Fireworker.prototype.destroy = function destroy () {
@@ -22,31 +118,62 @@ Fireworker.prototype.destroy = function destroy () {
   }
   this._callbacks = {};
   this._port.onmessage = null;
+  this._messages = [];
+  var k = fireworkers.indexOf(this);
+  if (k >= 0) { fireworkers[k] = null; }
+};
+
+Fireworker.prototype.ping = function ping () {
+  this.lastTouched = Date.now();
 };
 
 Fireworker.prototype._receive = function _receive (event) {
     var this$1 = this;
 
   Fireworker._firstMessageReceived = true;
+  this.lastTouched = Date.now();
+  for (var i = 0, list = event.data; i < list.length; i += 1) {
+      var message = list[i];
+
+      this$1._receiveMessage(message);
+    }
+};
+
+Fireworker.prototype._receiveMessage = function _receiveMessage (message) {
+    var this$1 = this;
+
   var promise;
   try {
-    promise = Promise.resolve(this[event.data.msg](event.data));
+    var fn = this[message.msg];
+    if (typeof fn !== 'function') { throw new Error('Unknown message: ' + message.msg); }
+    promise = Promise.resolve(fn.call(this, message));
   } catch(e) {
     promise = Promise.reject(e);
   }
-  promise.then(function (result) {
-    this$1._send({msg: 'resolve', id: event.data.id, result: result});
-  }, function(error) {
-    this._send({msg: 'reject', id: event.data.id, error: errorToJson(error)});
-  });
+  if (!message.oneWay) {
+    promise.then(function (result) {
+      this$1._send({msg: 'resolve', id: message.id, result: result});
+    }, function (error) {
+      this$1._send({msg: 'reject', id: message.id, error: errorToJson(error)});
+    });
+  }
 };
 
 Fireworker.prototype._send = function _send (message) {
-  this._port.postMessage(message);
+  if (!this._messages.length) { setImmediate(this._flushMessageQueue); }
+  this._messages.push(message);
 };
 
-Fireworker.prototype.init = function init () {
-  return Object.keys(Fireworker._exposed);
+Fireworker.prototype._flushMessageQueue = function _flushMessageQueue () {
+  this._port.postMessage(this._messages);
+  this._messages = [];
+};
+
+Fireworker.prototype.connect = function connect () {
+  return {
+    exposedMethodNames: Object.keys(Fireworker._exposed),
+    firebaseSdkVersion: Firebase.SDK_VERSION
+  };
 };
 
 Fireworker.prototype.call = function call (ref) {
@@ -84,7 +211,9 @@ Fireworker.prototype.authWithOAuthToken = function authWithOAuthToken (ref) {
   return createRef(url).authWithOAuthToken(provider, credentials, options);
 };
 
-Fireworker.prototype.unauth = function unauth (url) {
+Fireworker.prototype.unauth = function unauth (ref) {
+    var url = ref.url;
+
   return createRef(url).unauth();
 };
 
@@ -99,6 +228,10 @@ Fireworker.prototype.onAuth = function onAuth (ref) {
 
 Fireworker.prototype._offAuth = function _offAuth (url, authCallback) {
   createRef(url).offAuth(authCallback);
+};
+
+Fireworker.prototype._onAuthCallback = function _onAuthCallback (callbackId, auth) {
+  this._send({msg: 'callback', id: callbackId, args: [auth]});
 };
 
 Fireworker.prototype.set = function set (ref) {
@@ -123,13 +256,16 @@ Fireworker.prototype.on = function on (ref) {
     var callbackId = ref.callbackId;
     var options = ref.options;
 
+  options = options || {};
   options.orderChildren = false;
-  for (var i = 0, list = terms; i < list.length; i += 1) {
-    var term = list[i];
+  if (terms) {
+    for (var i = 0, list = terms; i < list.length; i += 1) {
+      var term = list[i];
 
-      if (term[0] === 'orderByChild' || term[0] === 'orderByValue') {
-      options.orderChildren = true;
-      break;
+        if (term[0] === 'orderByChild' || term[0] === 'orderByValue') {
+        options.orderChildren = true;
+        break;
+      }
     }
   }
   var snapshotCallback = this._callbacks[callbackId] =
@@ -170,24 +306,55 @@ Fireworker.prototype.off = function off (ref) {
 };
 
 Fireworker.prototype._onSnapshotCallback = function _onSnapshotCallback (callbackId, options, snapshot) {
-  var value = options.omitValue ? undefined : snapshot.val();
-  var exists = snapshot.exists();
-  var hasChildren = snapshot.hasChildren();
-  var childrenKeys;
-  if (!options.omitValue && options.orderChildren && hasChildren) {
-    childrenKeys = [];
-    snapshot.forEach(function (child) {
-      for (var key in value) { if (value[key] === child) { childrenKeys.push(key); } }
-    });
-  }
-  this._send({msg: 'callback', id: callbackId, args: [
-    null, {url: snapshot.ref().toString(), childrenKeys: childrenKeys, value: value, exists: exists, hasChildren: hasChildren}
-  ]});
+  this._send({msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]});
 };
 
 Fireworker.prototype._onCancelCallback = function _onCancelCallback (callbackId, error) {
   delete this._callbacks[callbackId];
   this._send({msg: 'callback', id: callbackId, args: [errorToJson(error)]});
+};
+
+Fireworker.prototype.once = function once (ref) {
+    var url = ref.url;
+    var terms = ref.terms;
+    var eventType = ref.eventType;
+    var options = ref.options;
+
+  return createRef(url, terms).once(eventType).then(
+    function (snapshot) { return snapshotToJson(snapshot, options); });
+};
+
+Fireworker.prototype.transaction = function transaction (ref$1) {
+    var url = ref$1.url;
+    var oldHash = ref$1.oldHash;
+    var newValue = ref$1.newValue;
+    var options = ref$1.options;
+
+  var ref = createRef(url);
+  var stale, currentValue, currentHash;
+
+  return ref.transaction(function (value) {
+    currentValue = value;
+    currentHash = hashJson(value);
+    stale = oldHash !== currentHash;
+    if (stale) { return; }
+    if (newValue === undefined && options.safeAbort) { return value; }
+    return newValue;
+  }, undefined, options.applyLocally).then(function (result) {
+    if (stale) {
+      return {stale: stale, value: currentValue, hash: currentHash};
+    } else {
+      return {
+        stale: false, committed: result.committed, snapshotJson: snapshotToJson(result.snapshot)
+      };
+    }
+  }, function (error) {
+    if (options.nonsequential && error.message === 'set') {
+      return ref.once('value').then(
+        function (value) { return ({stale: true, value: value, hash: hashJson(value)}); });
+    }
+    return Promise.reject(error);
+  });
 };
 
 Fireworker.expose = function expose (fn) {
@@ -215,19 +382,81 @@ function errorToJson(error) {
   return json;
 }
 
-function createRef(url, terms) {
-  var ref = new Firebase(url);
-  if (terms) {
-    for (var i = 0, list = terms; i < list.length; i += 1) {
-      var term = list[i];
-
-      ref = ref[term[0]].apply(ref, term.slice(1));
+function snapshotToJson(snapshot, options) {
+  var url = snapshot.ref().toString();
+  if (options && options.omitValue) {
+    return {url: url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren()};
+  } else {
+    var value = snapshot.val();
+    var childrenKeys;
+    if (options && options.orderChildren && typeof value === 'object') {
+      for (var key in value) {
+        if (!value.hasOwnProperty(key)) { continue; }
+        // Non-enumerable properties won't be transmitted when sending.
+        Object.defineProperty(value[key], '$key', {value: key});
+      }
+      childrenKeys = [];
+      snapshot.forEach(function (child) {childrenKeys.push(child.$key);});
     }
+    return {url: url, value: value, childrenKeys: childrenKeys};
   }
-  return ref;
 }
 
-var fireworkers = [];
+function createRef(url, terms) {
+  try {
+    var ref = new Firebase(url);
+    if (terms) {
+      for (var i = 0, list = terms; i < list.length; i += 1) {
+        var term = list[i];
+
+        ref = ref[term[0]].apply(ref, term.slice(1));
+      }
+    }
+    return ref;
+  } catch (e) {
+    console.error(url, terms, e);
+    throw e;
+  }
+}
+
+function hashJson(json) {
+  if (json === null) { return null; }
+  var sha1 = CryptoJS.algo.SHA1.create();
+  _hashJson(json, sha1);
+  return 'sha1:' + sha1.finalize().toString();
+}
+
+function _hashJson(json, sha1) {
+  var type = typeof json;
+  if (type === 'object') {
+    if (json === null) { type = 'null'; }
+    else if (Array.isArray(json)) { type = 'array'; }
+    else if (json instanceof Boolean) { type = 'boolean'; }
+    else if (json instanceof Number) { type = 'number'; }
+    else if (json instanceof String) { type = 'string'; }
+  }
+  switch (type) {
+    case 'undefined': sha1.update('u'); break;
+    case 'null': sha1.update('n'); break;
+    case 'boolean': sha1.update(json ? 't' : 'f'); break;
+    case 'number': sha1.update('x' + json); break;
+    case 'string': sha1.update('s' + json); break;
+    case 'array':
+      sha1.update('[');
+      for (var i = 0; i < json.length; i++) { _hashJson(json[i], sha1); }
+      sha1.update(']');
+      break;
+    case 'object':
+      sha1.update('{');
+      var keys = Object.keys(json);
+      keys.sort();
+      for (var i$1 = 0; i$1 < keys.length; i$1++) { _hashJson(json[keys[i$1]], sha1); }
+      sha1.update('}');
+      break;
+    default:
+      throw new Error('Unable to hash non-JSON data: ' + type);
+  }
+}
 
 function acceptConnections() {
   if (typeof onconnect !== 'undefined') {
@@ -237,9 +466,25 @@ function acceptConnections() {
   } else {
     fireworkers.push(new Fireworker(self));
   }
+  localStorage.flushPending();
 }
 
+var CONNECTION_CHECK_INTERVAL = 60 * 1000;
+var lastConnectionCheck = Date.now();
+setInterval(function findAbandonedConnections() {
+  var now = Date.now(), gap = now - lastConnectionCheck - CONNECTION_CHECK_INTERVAL;
+  lastConnectionCheck = now;
+  fireworkers.forEach(function (worker) {
+    if (!worker) { return; }
+    if (gap >= 1000 && worker.lastTouched <= now - gap) { worker.lastTouched += gap; }
+    if (now - worker.lastTouched >= 3 * CONNECTION_CHECK_INTERVAL) { worker.destroy(); }
+  });
+  var k;
+  while ((k = fireworkers.indexOf(null)) >= 0) { fireworkers.splice(k, 1); }
+}, CONNECTION_CHECK_INTERVAL);
+
 self.Fireworker = Fireworker;
+self.window = self;
 acceptConnections();
 
 })();
