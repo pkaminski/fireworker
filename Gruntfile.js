@@ -44,6 +44,12 @@ module.exports = function(grunt) {
       }
     },
 
+    gitadd: {
+      dist: {
+        src: 'dist/*'
+      }
+    },
+
     release: {
       options: {
         additionalFiles: ['bower.json'],
@@ -54,7 +60,7 @@ module.exports = function(grunt) {
   });
 
   grunt.registerTask('default', [
-    'clean:dist', 'buble', 'uglify'
+    'clean:dist', 'buble', 'uglify', 'gitadd'
   ]);
 
 };
