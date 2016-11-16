@@ -107,6 +107,10 @@ Fireworker.prototype.init = function init (ref) {
 
   if (storage) { self.localStorage.init(storage); }
   if (url) { new Firebase(url); }
+  return {
+    exposedFunctionNames: Object.keys(Fireworker._exposed),
+    firebaseSdkVersion: Firebase.SDK_VERSION
+  };
 };
 
 Fireworker.prototype.destroy = function destroy () {
@@ -167,13 +171,6 @@ Fireworker.prototype._send = function _send (message) {
 Fireworker.prototype._flushMessageQueue = function _flushMessageQueue () {
   this._port.postMessage(this._messages);
   this._messages = [];
-};
-
-Fireworker.prototype.connect = function connect () {
-  return {
-    exposedMethodNames: Object.keys(Fireworker._exposed),
-    firebaseSdkVersion: Firebase.SDK_VERSION
-  };
 };
 
 Fireworker.prototype.call = function call (ref) {
@@ -466,7 +463,7 @@ function acceptConnections() {
   } else {
     fireworkers.push(new Fireworker(self));
   }
-  localStorage.flushPending();
+  self.localStorage.flushPending();
 }
 
 var CONNECTION_CHECK_INTERVAL = 60 * 1000;

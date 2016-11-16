@@ -1,9 +1,10 @@
 (function() {
 'use strict';
 
-/* globals window, setImmediate, setInterval */
+/* globals window, setImmediate, setTimeout, setInterval */
 
 var worker;
+var errorCallbacks = [];
 
 var ALPHABET = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
 var MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
@@ -314,28 +315,16 @@ var Firebase = (function (Query) {
       }
     }
 
-    var onCompleteCalled = !!onComplete;
     // Hold the ref value live until transaction complete, otherwise it'll keep retrying on a null
     // value.
-    this.on('value', noop, function (error) {
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(error);
-      }
-    });
+    this.on('value', noop);  // No error handling -- if this fails, so will the transaction.
     return worker.transaction(this._url, updateFunction, options).then(function (result) {
       this$1.off('value', noop);
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(null, result.committed, result.snapshot);
-      }
+      if (onComplete) { onComplete(null, result.committed, result.snapshot); }
       return result;
     }, function (error) {
       this$1.off('value', noop);
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(error);
-      }
+      if (onComplete) { onComplete(error); }
       return Promise.reject(error);
     });
   };
@@ -343,7 +332,11 @@ var Firebase = (function (Query) {
   Firebase.connectWorker = function connectWorker (webWorker) {
     if (worker) { throw new Error('Worker already connected'); }
     worker = new FirebaseWorker(webWorker);
-    return worker._ready;
+    return worker.init();
+  };
+
+  Firebase.preExpose = function preExpose (functionName) {
+    Firebase.worker[functionName] = worker.bindExposedFunction(functionName);
   };
 
   Firebase.goOnline = function goOnline () {
@@ -354,6 +347,20 @@ var Firebase = (function (Query) {
     throw new Error('Global goOffline() call must be made from within the worker process');
   };
 
+  Firebase.enableLogging = function enableLogging () {
+    throw new Error('Global enableLogging() call must be made from within the worker process');
+  };
+
+  Firebase.onError = function onError (callback) {
+    errorCallbacks.push(callback);
+    return callback;
+  };
+
+  Firebase.offError = function offError (callback) {
+    var k = errorCallbacks.indexOf(callback);
+    if (k !== -1) { errorCallbacks.splice(k, 1); }
+  };
+
   return Firebase;
 }(Query));
 
@@ -362,6 +369,7 @@ Firebase.DefaultTransactionOptions = Object.seal({
   applyLocally: true, nonsequential: false, safeAbort: false
 });
 Firebase.ABORT_TRANSACTION_NOW = Object.create(null);
+Firebase.worker = {};
 
 
 // jshint latedef:false
@@ -378,43 +386,38 @@ var FirebaseWorker = function FirebaseWorker(webWorker) {
   this._port = webWorker.port || webWorker;
   this._shared = !!webWorker.port;
   this._port.onmessage = this._receive.bind(this);
-  this._initStorageItems();
-  this._connect();
   window.addEventListener('unload', function () {this$1._send({msg: 'destroy'});});
   setInterval(function () {this$1._send({msg: 'ping'});}, 60 * 1000);
 };
 
-FirebaseWorker.prototype._initStorageItems = function _initStorageItems () {
+FirebaseWorker.prototype.init = function init () {
+    var this$1 = this;
+
+  var items = [];
   try {
     var storage = window.localStorage || window.sessionStorage;
     if (!storage) { return; }
-    var items = [];
     for (var i = 0; i < storage.length; i++) {
       var key = storage.key(i);
       items.push({key: key, value: storage.getItem(key)});
     }
-    this._send({msg: 'init', storage: items});
   } catch (e) {
     // Some browsers don't like us accessing local storage -- nothing we can do.
   }
-};
+  return this._send({msg: 'init', storage: items}).then(
+    function (ref) {
+        var exposedFunctionNames = ref.exposedFunctionNames;
+        var firebaseSdkVersion = ref.firebaseSdkVersion;
 
-FirebaseWorker.prototype._connect = function _connect () {
-    var this$1 = this;
+      Firebase.SDK_VERSION =
+        firebaseSdkVersion + " (over " + (this$1._shared ? 'shared ' : '') + "fireworker)";
+      for (var i = 0, list = exposedFunctionNames; i < list.length; i += 1) {
+        var name = list[i];
 
-  this._ready = this._send({msg: 'connect'}).then(function (ref) {
-      var exposedMethodNames = ref.exposedMethodNames;
-      var firebaseSdkVersion = ref.firebaseSdkVersion;
-
-    Firebase.SDK_VERSION =
-      firebaseSdkVersion + " (over " + (this$1._shared ? 'shared ' : '') + "fireworker)";
-    var worker = window.Firebase.worker = {};
-    for (var i = 0, list = exposedMethodNames; i < list.length; i += 1) {
-      var name = list[i];
-
-        worker[name] = this$1._bindExposedFunction(name);
+          Firebase.worker[name] = this$1.bindExposedFunction(name);
+      }
     }
-  });
+  );
 };
 
 FirebaseWorker.prototype._send = function _send (message) {
@@ -449,7 +452,7 @@ FirebaseWorker.prototype._receive = function _receive (event) {
   }
 };
 
-FirebaseWorker.prototype._bindExposedFunction = function _bindExposedFunction (name) {
+FirebaseWorker.prototype.bindExposedFunction = function bindExposedFunction (name) {
   return (function() {
     return this._send({msg: 'call', name: name, args: Array.prototype.slice(arguments)});
   }).bind(this);
@@ -466,7 +469,9 @@ FirebaseWorker.prototype.reject = function reject (message) {
   var deferred = this._deferreds[message.id];
   if (!deferred) { throw new Error('fireworker received rejection of inexistent call'); }
   delete this._deferreds[message.id];
-  deferred.reject(errorFromJson(message.error));
+  var error = errorFromJson(message.error);
+  deferred.reject(error);
+  emitError(error);
 };
 
 FirebaseWorker.prototype.updateLocalStorage = function updateLocalStorage (items) {
@@ -481,7 +486,6 @@ FirebaseWorker.prototype.updateLocalStorage = function updateLocalStorage (items
     }
   } catch (e) {
     // If we're denied access, there's nothing we can do.
-    console.log(e);
   }
 };
 
@@ -651,7 +655,9 @@ FirebaseWorker.prototype.off = function off (listenerKey, url, terms, eventType,
 FirebaseWorker.prototype._onCallback = function _onCallback (handle, error, snapshotJson) {
   if (error) {
     this._deregisterCallback(handle.id);
-    if (handle.cancelCallback) { handle.cancelCallback.call(handle.context, errorFromJson(error)); }
+    error = errorFromJson(error);
+    if (handle.cancelCallback) { handle.cancelCallback.call(handle.context, error); }
+    emitError(error);
   } else {
     handle.snapshotCallback.call(handle.context, new Snapshot(snapshotJson));
   }
@@ -737,6 +743,18 @@ function errorFromJson(json) {
     error[propertyName] = json[propertyName];
   }
   return error;
+}
+
+function emitError(error) {
+  if (errorCallbacks.length) {
+    setTimeout(function () {
+      for (var i = 0, list = errorCallbacks; i < list.length; i += 1) {
+        var callback = list[i];
+
+        callback(error);
+      }
+    }, 0);
+  }
 }
 
 function noop() {}
