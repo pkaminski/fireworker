@@ -95,6 +95,10 @@ class Fireworker {
   init({storage, url}) {
     if (storage) self.localStorage.init(storage);
     if (url) new Firebase(url);
+    return {
+      exposedFunctionNames: Object.keys(Fireworker._exposed),
+      firebaseSdkVersion: Firebase.SDK_VERSION
+    };
   }
 
   destroy() {
@@ -145,13 +149,6 @@ class Fireworker {
   _flushMessageQueue() {
     this._port.postMessage(this._messages);
     this._messages = [];
-  }
-
-  connect() {
-    return {
-      exposedMethodNames: Object.keys(Fireworker._exposed),
-      firebaseSdkVersion: Firebase.SDK_VERSION
-    };
   }
 
   call({name, args}) {
@@ -385,7 +382,7 @@ function acceptConnections() {
   } else {
     fireworkers.push(new Fireworker(self));
   }
-  localStorage.flushPending();
+  self.localStorage.flushPending();
 }
 
 const CONNECTION_CHECK_INTERVAL = 60 * 1000;

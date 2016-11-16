@@ -69,14 +69,30 @@ You don't need to do anything special on the worker side.
 
 ## Extra features
 
+### Snapshot control
 For `on` and `once`, you can set extra flags on the callback function:
   - `omitSnapshotValue`: if truthy, the actual snapshot value won't be materialized and transmitted from the worker to the client.  Your callback (or promise, for `once`) will still get a snapshot, but calling methods that rely on the value &mdash; like `val` or `forEach` &mdash; will throw an exception.
   - `skipCallback`: if truthy, your callback won't be invoked at all &mdash; this is useful for keeping a value synced for the benefit of other transient listeners without the overhead of creating and transmitting snapshots to the client.
 
+### Transaction tweaks
 For `transaction`, you can set some extra flags on the `updateFunction`:
   - `safeAbort`: if truthy, any `undefined` value returned by your update function will be substituted with the original value passed into the transaction, to force Firebase to validate that it is still current against the server instead of aborting immediately.  (You can also return `Firebase.ABORT_TRANSACTION_NOW` from `updateFunction` to override this on case-by-case basis.)
   - `nonsequential`: if truthy, will keep retrying the transaction in the face of interfering non-transactional operations, up to the usual max number of retries.
 You can also set global defaults for all these flags (including the traditional `applyLocally`) on `Firebase.DefaultTransactionOptions`.  `applyLocally` starts out as `true` and the others as `false`.
 
-- TODO: document exposing custom worker functions
+### Global error listener
+You can use `Firebase.onError(callback)` to attach a handler that will be invoked for any error emitted by a Firebase function.  The callback will be invoked through `setTimeout` so you'll have a chance to catch the error locally first, and perhaps set a flag on it to indicate that it's been dealt with.  This mechanism is essentially equivalent to the unhandled promise rejection handler that some browsers support, but specialized to only functions that you call on the worker.
+
+### Custom worker functions
+Sometimes you need to augment the worker directly with extra code that needs to run on the original Firebase SDK (e.g., [Firecrypt](https://github.com/pkaminski/firecrypt)), and expose some means of configuring or controlling this code to the client.  You can do this calling `Fireworker.expose(myCustomFunction)` for each function you'd like to make callable from the client; you must do this before any client has connected &mdash; basically when the worker script is loading.
+
+On the client, you can then call `Firebase.worker.myCustomFunction()`.  You can pass simple arguments (not callback functions, though!) and will get a promise in return, that will resolve to the return value of the original function executing in the worker.  These exposed functions are only available once the client's connection has been initialized, as indicated by the promise returned from `Firebase.connectWorker()` resolving.
+
+Sometimes, you need to make sure that a custom function gets invoked before any Firebase operation takes place.  You can accomplish this like so:
+```
+Firebase.connectWorker(firebaseWorker);
+Firebase.preExpose('myCustomFunction');
+Firebase.worker.myCustomFunction();
+```
+Note that if `myCustomFunction` isn't actually exposed by the worker code, the function call will fail (asychronously).
 

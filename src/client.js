@@ -1,9 +1,10 @@
 (function() {
 'use strict';
 
-/* globals window, setImmediate, setInterval */
+/* globals window, setImmediate, setTimeout, setInterval */
 
 let worker;
+const errorCallbacks = [];
 
 const ALPHABET = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
 const MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
@@ -299,28 +300,16 @@ class Firebase extends Query {
       }
     }
 
-    let onCompleteCalled = !!onComplete;
     // Hold the ref value live until transaction complete, otherwise it'll keep retrying on a null
     // value.
-    this.on('value', noop, error => {
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(error);
-      }
-    });
+    this.on('value', noop);  // No error handling -- if this fails, so will the transaction.
     return worker.transaction(this._url, updateFunction, options).then(result => {
       this.off('value', noop);
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(null, result.committed, result.snapshot);
-      }
+      if (onComplete) onComplete(null, result.committed, result.snapshot);
       return result;
     }, error => {
       this.off('value', noop);
-      if (!onCompleteCalled) {
-        onCompleteCalled = true;
-        onComplete(error);
-      }
+      if (onComplete) onComplete(error);
       return Promise.reject(error);
     });
   }
@@ -328,7 +317,11 @@ class Firebase extends Query {
   static connectWorker(webWorker) {
     if (worker) throw new Error('Worker already connected');
     worker = new FirebaseWorker(webWorker);
-    return worker._ready;
+    return worker.init();
+  }
+
+  static preExpose(functionName) {
+    Firebase.worker[functionName] = worker.bindExposedFunction(functionName);
   }
 
   static goOnline() {
@@ -338,6 +331,24 @@ class Firebase extends Query {
   static goOffline() {
     throw new Error('Global goOffline() call must be made from within the worker process');
   }
+
+  static enableLogging() {
+    throw new Error('Global enableLogging() call must be made from within the worker process');
+  }
+
+  static onError(callback) {
+    errorCallbacks.push(callback);
+    return callback;
+  }
+
+  static offError(callback) {
+    var k = errorCallbacks.indexOf(callback);
+    if (k !== -1) errorCallbacks.splice(k, 1);
+  }
+
+  // TODO: add onSlowWrite
+  // TODO: add debugPermissionDeniedErrors
+  // TODO: add bounceZombieConnections
 }
 
 Firebase.ServerValue = Object.freeze({TIMESTAMP: Object.freeze({'.sv': 'timestamp'})});
@@ -345,6 +356,7 @@ Firebase.DefaultTransactionOptions = Object.seal({
   applyLocally: true, nonsequential: false, safeAbort: false
 });
 Firebase.ABORT_TRANSACTION_NOW = Object.create(null);
+Firebase.worker = {};
 
 
 // jshint latedef:false
@@ -361,36 +373,31 @@ class FirebaseWorker {
     this._port = webWorker.port || webWorker;
     this._shared = !!webWorker.port;
     this._port.onmessage = this._receive.bind(this);
-    this._initStorageItems();
-    this._connect();
     window.addEventListener('unload', () => {this._send({msg: 'destroy'});});
     setInterval(() => {this._send({msg: 'ping'});}, 60 * 1000);
   }
 
-  _initStorageItems() {
+  init() {
+    const items = [];
     try {
       const storage = window.localStorage || window.sessionStorage;
       if (!storage) return;
-      const items = [];
       for (let i = 0; i < storage.length; i++) {
         const key = storage.key(i);
         items.push({key, value: storage.getItem(key)});
       }
-      this._send({msg: 'init', storage: items});
     } catch (e) {
       // Some browsers don't like us accessing local storage -- nothing we can do.
     }
-  }
-
-  _connect() {
-    this._ready = this._send({msg: 'connect'}).then(({exposedMethodNames, firebaseSdkVersion}) => {
-      Firebase.SDK_VERSION =
-        `${firebaseSdkVersion} (over ${this._shared ? 'shared ' : ''}fireworker)`;
-      const worker = window.Firebase.worker = {};
-      for (let name of exposedMethodNames) {
-        worker[name] = this._bindExposedFunction(name);
+    return this._send({msg: 'init', storage: items}).then(
+      ({exposedFunctionNames, firebaseSdkVersion}) => {
+        Firebase.SDK_VERSION =
+          `${firebaseSdkVersion} (over ${this._shared ? 'shared ' : ''}fireworker)`;
+        for (let name of exposedFunctionNames) {
+          Firebase.worker[name] = this.bindExposedFunction(name);
+        }
       }
-    });
+    );
   }
 
   _send(message) {
@@ -419,7 +426,7 @@ class FirebaseWorker {
     }
   }
 
-  _bindExposedFunction(name) {
+  bindExposedFunction(name) {
     return (function() {
       return this._send({msg: 'call', name, args: Array.prototype.slice(arguments)});
     }).bind(this);
@@ -436,7 +443,9 @@ class FirebaseWorker {
     const deferred = this._deferreds[message.id];
     if (!deferred) throw new Error('fireworker received rejection of inexistent call');
     delete this._deferreds[message.id];
-    deferred.reject(errorFromJson(message.error));
+    const error = errorFromJson(message.error);
+    deferred.reject(error);
+    emitError(error);
   }
 
   updateLocalStorage(items) {
@@ -451,7 +460,6 @@ class FirebaseWorker {
       }
     } catch (e) {
       // If we're denied access, there's nothing we can do.
-      console.log(e);
     }
   }
 
@@ -605,7 +613,9 @@ class FirebaseWorker {
   _onCallback(handle, error, snapshotJson) {
     if (error) {
       this._deregisterCallback(handle.id);
-      if (handle.cancelCallback) handle.cancelCallback.call(handle.context, errorFromJson(error));
+      error = errorFromJson(error);
+      if (handle.cancelCallback) handle.cancelCallback.call(handle.context, error);
+      emitError(error);
     } else {
       handle.snapshotCallback.call(handle.context, new Snapshot(snapshotJson));
     }
@@ -687,6 +697,14 @@ function errorFromJson(json) {
     error[propertyName] = json[propertyName];
   }
   return error;
+}
+
+function emitError(error) {
+  if (errorCallbacks.length) {
+    setTimeout(() => {
+      for (let callback of errorCallbacks) callback(error);
+    }, 0);
+  }
 }
 
 function noop() {}
