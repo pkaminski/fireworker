@@ -117,6 +117,11 @@ class Fireworker {
     this.lastTouched = Date.now();
   }
 
+  bounceConnection() {
+    Firebase.goOffline();
+    Firebase.goOnline();
+  }
+
   _receive(event) {
     Fireworker._firstMessageReceived = true;
     this.lastTouched = Date.now();
@@ -276,6 +281,11 @@ class Fireworker {
       }
       return Promise.reject(error);
     });
+  }
+
+  onDisconnect({url, method, value}) {
+    const onDisconnect = createRef(url).onDisconnect();
+    return onDisconnect[method].call(onDisconnect, value);
   }
 
   static expose(fn) {

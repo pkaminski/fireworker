@@ -1,10 +1,11 @@
 (function() {
 'use strict';
 
-/* globals window, setImmediate, setTimeout, setInterval */
+/* globals window, setImmediate, setTimeout, clearTimeout, setInterval */
 
 let worker;
 const errorCallbacks = [];
+const slowCallbacks = {read: [], write: [], auth: [], onDisconnect: []};
 
 const ALPHABET = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
 const MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
@@ -117,6 +118,29 @@ class Snapshot {
   }
 }
 
+class OnDisconnect {
+  constructor(url) {
+    this._url = url;
+  }
+
+  set(value, onComplete) {
+    return attachCallback(worker.onDisconnect(this._url, 'set', value), onComplete, 'onDisconnect');
+  }
+
+  update(value, onComplete) {
+    return attachCallback(
+      worker.onDisconnect(this._url, 'update', value), onComplete, 'onDisconnect');
+  }
+
+  remove(onComplete) {
+    return attachCallback(worker.onDisconnect(this._url, 'remove'), onComplete, 'onDisconnect');
+  }
+
+  cancel(onComplete) {
+    return attachCallback(worker.onDisconnect(this._url, 'cancel'), onComplete, 'onDisconnect');
+  }
+}
+
 class Query {
   constructor(url, terms) {
     if (!worker) throw new Error('Worker not connected');
@@ -146,9 +170,16 @@ class Query {
       context = failureCallback;
       failureCallback = undefined;
     }
-    return worker.once(
-      this._url, this._terms, eventType, successCallback, failureCallback, context,
-      {omitValue: !!(successCallback && successCallback.omitSnapshotValue)});
+    return trackSlowness(worker.once(
+      this._url, this._terms, eventType,
+      {omitValue: !!(successCallback && successCallback.omitSnapshotValue)}
+    ), 'read').then(snapshot => {
+      if (successCallback) successCallback.call(context, snapshot);
+      return snapshot;
+    }, error => {
+      if (failureCallback) failureCallback.call(context, error);
+      return Promise.reject(error);
+    });
   }
 
   ref() {
@@ -201,7 +232,8 @@ class Firebase extends Query {
       options = onComplete;
       onComplete = null;
     }
-    return attachCallback(worker.authWithCustomToken(this._url, authToken, options), onComplete);
+    return attachCallback(
+      worker.authWithCustomToken(this._url, authToken, options), onComplete, 'auth');
   }
 
   authAnonymously(onComplete, options) {
@@ -209,7 +241,7 @@ class Firebase extends Query {
       options = onComplete;
       onComplete = null;
     }
-    return attachCallback(worker.authAnonymously(this._url, options), onComplete);
+    return attachCallback(worker.authAnonymously(this._url, options), onComplete, 'auth');
   }
 
   authWithOAuthToken(provider, credentials, onComplete, options) {
@@ -218,7 +250,7 @@ class Firebase extends Query {
       onComplete = null;
     }
     return attachCallback(
-      worker.authWithCustomToken(this._url, provider, credentials, options), onComplete);
+      worker.authWithCustomToken(this._url, provider, credentials, options), onComplete, 'auth');
   }
 
   authWithPassword() {
@@ -268,15 +300,15 @@ class Firebase extends Query {
   }
 
   set(value, onComplete) {
-    return attachCallback(worker.set(this._url, value), onComplete);
+    return attachCallback(worker.set(this._url, value), onComplete, 'write');
   }
 
   update(value, onComplete) {
-    return attachCallback(worker.update(this._url, value), onComplete);
+    return attachCallback(worker.update(this._url, value), onComplete, 'write');
   }
 
   remove(onComplete) {
-    return attachCallback(worker.set(this._url, null), onComplete);
+    return attachCallback(worker.set(this._url, null), onComplete, 'write');
   }
 
   push(value, onComplete) {
@@ -303,7 +335,9 @@ class Firebase extends Query {
     // Hold the ref value live until transaction complete, otherwise it'll keep retrying on a null
     // value.
     this.on('value', noop);  // No error handling -- if this fails, so will the transaction.
-    return worker.transaction(this._url, updateFunction, options).then(result => {
+    return trackSlowness(
+      worker.transaction(this._url, updateFunction, options), 'write'
+    ).then(result => {
       this.off('value', noop);
       if (onComplete) onComplete(null, result.committed, result.snapshot);
       return result;
@@ -312,6 +346,10 @@ class Firebase extends Query {
       if (onComplete) onComplete(error);
       return Promise.reject(error);
     });
+  }
+
+  onDisconnect() {
+    return new OnDisconnect(this._url);
   }
 
   static connectWorker(webWorker) {
@@ -325,11 +363,15 @@ class Firebase extends Query {
   }
 
   static goOnline() {
-    throw new Error('Global goOnline() call must be made from within the worker process');
+    worker.activate(true);
   }
 
   static goOffline() {
-    throw new Error('Global goOffline() call must be made from within the worker process');
+    worker.activate(false);
+  }
+
+  static bounceConnection() {
+    return worker.bounceConnection();
   }
 
   static enableLogging() {
@@ -346,9 +388,26 @@ class Firebase extends Query {
     if (k !== -1) errorCallbacks.splice(k, 1);
   }
 
-  // TODO: add onSlowWrite
+  static onSlow(operationKind, timeout, callback) {
+    const kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
+    for (let kind of kinds) slowCallbacks[kind].push({timeout, callback, count: 0});
+    return callback;
+  }
+
+  static offSlow(operationKind, callback) {
+    const kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
+    for (let kind of kinds) {
+      const records = slowCallbacks[kind];
+      for (let i = 0; i < records.length; i++) {
+        if (records[i].callback === callback) {
+          records.splice(i, 1);
+          break;
+        }
+      }
+    }
+  }
+
   // TODO: add debugPermissionDeniedErrors
-  // TODO: add bounceZombieConnections
 }
 
 Firebase.ServerValue = Object.freeze({TIMESTAMP: Object.freeze({'.sv': 'timestamp'})});
@@ -359,16 +418,42 @@ Firebase.ABORT_TRANSACTION_NOW = Object.create(null);
 Firebase.worker = {};
 
 
+class SlownessTracker {
+  constructor(record) {
+    this.record = record;
+    this.counted = false;
+    this.canceled = false;
+    this.handle = setTimeout(this.handleTimeout.bind(this), record.timeout);
+  }
+
+  handleTimeout() {
+    if (this.canceled) return;
+    this.counted = true;
+    this.record.callback(++this.record.count, 1, this.record.timeout);
+  }
+
+  handleDone() {
+    this.canceled = true;
+    if (this.counted) {
+      this.record.callback(--this.record.count, -1, this.record.timeout);
+    } else {
+      clearTimeout(this.handle);
+    }
+  }
+}
+
+
 // jshint latedef:false
 class FirebaseWorker {
 // jshint latedef:nofunc
   constructor(webWorker) {
     this._idCounter = 0;
     this._deferreds = {};
-    this._online = true;
+    this._active = true;
     this._servers = {};
     this._callbacks = {};
-    this._messages = [];
+    this._inboundMessages = [];
+    this._outboundMessages = [];
     this._flushMessageQueue = this._flushMessageQueue.bind(this);
     this._port = webWorker.port || webWorker;
     this._shared = !!webWorker.port;
@@ -400,26 +485,44 @@ class FirebaseWorker {
     );
   }
 
+  activate(enabled) {
+    if (this._active === enabled) return;
+    this._active = enabled;
+    if (enabled) {
+      this._receiveMessages(this._inboundMessages);
+      this._inboundMessages = [];
+      if (this._outboundMessages.length) setImmediate(this._flushMessageQueue);
+    }
+  }
+
   _send(message) {
     message.id = ++this._idCounter;
     const promise = new Promise((resolve, reject) => {
       this._deferreds[message.id] = {resolve, reject};
     });
     this._deferreds[message.id].promise = promise;
-    if (!this._messages.length) setImmediate(this._flushMessageQueue);
-    this._messages.push(message);
+    if (!this._outboundMessages.length && this._active) setImmediate(this._flushMessageQueue);
+    this._outboundMessages.push(message);
     return promise;
   }
 
   _flushMessageQueue() {
-    // console.log('send', this._messages);
-    this._port.postMessage(this._messages);
-    this._messages = [];
+    // console.log('send', this._outboundMessages);
+    this._port.postMessage(this._outboundMessages);
+    this._outboundMessages = [];
   }
 
   _receive(event) {
     // console.log('receive', event.data);
-    for (let message of event.data) {
+    if (this._active) {
+      this._receiveMessages(event.data);
+    } else {
+      this._inboundMessages = this._inboundMessages.concat(event.data);
+    }
+  }
+
+  _receiveMessages(messages) {
+    for (let message of messages) {
       const fn = this[message.msg];
       if (typeof fn !== 'function') throw new Error('Unknown message: ' + message.msg);
       fn.call(this, message);
@@ -556,7 +659,10 @@ class FirebaseWorker {
   update(url, value) {return this._send({msg: 'update', url, value});}
 
   on(listenerKey, url, terms, eventType, snapshotCallback, cancelCallback, context, options) {
-    const handle = {listenerKey, eventType, snapshotCallback, cancelCallback, context};
+    const handle = {
+      listenerKey, eventType, snapshotCallback, cancelCallback, context,
+      timeouts: slowCallbacks.read.map(record => new SlownessTracker(record))
+    };
     const callback = this._onCallback.bind(this, handle);
     this._registerCallback(callback, handle);
     // Keep multiple IDs to allow the same snapshotCallback to be reused.
@@ -611,6 +717,9 @@ class FirebaseWorker {
   }
 
   _onCallback(handle, error, snapshotJson) {
+    if (handle.timeouts) {
+      for (let timeout of handle.timeouts) timeout.handleDone();
+    }
     if (error) {
       this._deregisterCallback(handle.id);
       error = errorFromJson(error);
@@ -621,14 +730,9 @@ class FirebaseWorker {
     }
   }
 
-  once(url, terms, eventType, successCallback, failureCallback, context, options) {
+  once(url, terms, eventType, options) {
     return this._send({msg: 'once', url, terms, eventType, options}).then(snapshotJson => {
-      const snapshot = new Snapshot(snapshotJson);
-      if (successCallback) successCallback.call(context, snapshot);
-      return snapshot;
-    }, error => {
-      if (failureCallback) failureCallback.call(context, error);
-      return Promise.reject(error);
+      return new Snapshot(snapshotJson);
     });
   }
 
@@ -659,6 +763,14 @@ class FirebaseWorker {
     return attemptTransaction(null, null);
   }
 
+  onDisconnect(url, method, value) {
+    return this._send({msg: 'onDisconnect', url, method, value});
+  }
+
+  bounceConnection() {
+    return this._send({msg: 'bounceConnection'});
+  }
+
   callback({id, args}) {
     const handle = this._callbacks[id];
     if (!handle) throw new Error('Unregistered callback: ' + id);
@@ -674,6 +786,10 @@ class FirebaseWorker {
   }
 
   _nullifyCallback(id) {
+    const handle = this._callbacks[id];
+    if (handle.timeouts) {
+      for (let timeout of handle.timeouts) timeout.handleDone();
+    }
     this._callbacks[id].callback = noop;
   }
 
@@ -683,14 +799,39 @@ class FirebaseWorker {
 }
 
 
-function attachCallback(promise, onComplete) {
+function attachCallback(promise, onComplete, operationKind) {
+  promise = trackSlowness(promise, operationKind);
   if (!onComplete) return promise;
-  return promise.then(result => {onComplete(null, result);}, error => {onComplete(error);});
+  return promise.then(
+    result => {onComplete(null, result); return result;},
+    error => {onComplete(error); return Promise.reject(error);}
+  );
+}
+
+function trackSlowness(promise, operationKind) {
+  const records = slowCallbacks[operationKind];
+  if (!records.length) return promise;
+
+  const timeouts = records.map(record => new SlownessTracker(record));
+
+  function opDone() {
+    for (let timeout of timeouts) timeout.handleDone();
+  }
+
+  promise = promise.then(result => {
+    opDone();
+    return result;
+  }, error => {
+    opDone();
+    return Promise.reject(error);
+  });
+
+  return promise;
 }
 
 function errorFromJson(json) {
   if (!json || json instanceof Error) return json;
-  console.log(json);
+  // console.log(json);
   const error = new Error();
   for (let propertyName in json) {
     if (!json.hasOwnProperty(propertyName)) continue;

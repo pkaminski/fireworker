@@ -25,8 +25,8 @@ The two components have different dependencies, but since they're both distribut
 On the client side, you need to create the worker and connect it to the client, like so:
 ```js
 var WorkerClass = window.SharedWorker || window.Worker;
-if (!WorkerClass) throw new Error('Browser doesn\'t support web workers -- panic!');
-Firebase.connectWorker(new WorkerClass('/path/to/worker/code.js'));
+if (!WorkerClass) throw new Error("Browser doesn't support web workers -- panic!");
+Firebase.connectWorker(new WorkerClass("/path/to/worker/code.js"));
 ```
 
 Optionally, you can optimize your startup performance by initializing the worker early, then connecting it to the `Firebase` shim later, when your code has loaded.  This will let the worker connect to Firebase and authenticate the user (if there's a saved session) while your main page is loading.  Put this script early on your page:
@@ -52,7 +52,7 @@ Optionally, you can optimize your startup performance by initializing the worker
 Then in your app, you connect the worker like this:
 
 ```js
-if (!window.firebaseWorker) throw new Error('Browser doesn\'t support web workers -- panic!');
+if (!window.firebaseWorker) throw new Error("Browser doesn't support web workers -- panic!");
 Firebase.connectWorker(window.firebaseWorker);
 ```
 
@@ -63,7 +63,8 @@ You don't need to do anything special on the worker side.
 
 - Some methods that used to have an immediate effect (e.g., `off` or `unauth`) are now async and return a promise.
 - Some exceptions that would normally be thrown synchronously (e.g., bad URL, bad combination of query methods) will make an operation fail asynchronously instead.  This should only affect development, and just means that you should always specify an error / failure callback (or catch a promise rejection).
-- `goOnline` and `goOffline` are purposely not support on the client, since they would affect all clients of a shared web worker.  If you need to use these, call them from the worker side instead.
+- `goOffline` will only prevent the client from communicating with the worker, preventing any reads and writes from being executed until `goOnline` is invoked.  Unlike in normal Firebase writes _will not_ be applied locally while "offline", and the connection to Firebase will not be closed.  If needed, you can call `goOffline` from within the worker for the original semantics (affecting all clients), or use `Firebase.bounceConnection()` to execute a `goOffline()` / `goOnline()` pair that will force Firebase to reconnect to the server.
+- `enableLogging` can only be called from within the worker.
 - Errors thrown by a `transaction`'s `updateFunction` will be caught and returned as an error on the transaction, instead of propagating to the top level (and possibly getting ignored).
 
 
@@ -81,7 +82,17 @@ For `transaction`, you can set some extra flags on the `updateFunction`:
 You can also set global defaults for all these flags (including the traditional `applyLocally`) on `Firebase.DefaultTransactionOptions`.  `applyLocally` starts out as `true` and the others as `false`.
 
 ### Global error listener
-You can use `Firebase.onError(callback)` to attach a handler that will be invoked for any error emitted by a Firebase function.  The callback will be invoked through `setTimeout` so you'll have a chance to catch the error locally first, and perhaps set a flag on it to indicate that it's been dealt with.  This mechanism is essentially equivalent to the unhandled promise rejection handler that some browsers support, but specialized to only functions that you call on the worker.
+You can use `Firebase.onError(callback)` to attach a handler that will be invoked for any error emitted by a Firebase function, and `Firebase.offError(callback)` to detach it.
+
+The callback will be invoked through `setTimeout` so you'll have a chance to catch the error locally first, and perhaps set a flag on it to indicate that it's been dealt with.  This mechanism is essentially equivalent to the unhandled promise rejection handler that some browsers support, but specialized to only functions that you call on the worker.
+
+### Global slow operation listeners
+You can get a callback whenever any read or write operation takes too long.  Use `Firebase.onSlow(operationKind, timeout, callback)` to attach a handler, where `operationKind` is one of `'read'`, `'write'`, `'auth'`, `'onDisconnect'`, or `'all'`, and `timeout` is the duration in milliseconds after which to invoke the callback if the operation has not yet been acknowledged by the Firebase server.  Use `Firebase.offSlow(operationKind, callback)` to detach the handler.
+
+The callback will be invoked with three arguments:
+- `outstandingCount`, the current number of outstanding slow operations (for the given timeout).
+- `delta`, which indicates whether the count just increased or decreased with +1 and -1 respectively.
+- `timeout`, the timeout value specified for this handler.
 
 ### Custom worker functions
 Sometimes you need to augment the worker directly with extra code that needs to run on the original Firebase SDK (e.g., [Firecrypt](https://github.com/pkaminski/firecrypt)), and expose some means of configuring or controlling this code to the client.  You can do this calling `Fireworker.expose(myCustomFunction)` for each function you'd like to make callable from the client; you must do this before any client has connected &mdash; basically when the worker script is loading.
