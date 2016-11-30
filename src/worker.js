@@ -4,6 +4,7 @@
 /* globals Firebase, CryptoJS, setImmediate, setInterval, self */
 
 const fireworkers = [];
+let simulationQueue = Promise.resolve(), consoleIntercepted = false, simulationConsoleLogs;
 
 
 class LocalStorage {
@@ -288,6 +289,28 @@ class Fireworker {
     return onDisconnect[method].call(onDisconnect, value);
   }
 
+  simulate({token, method, url, args}) {
+    interceptConsoleLog();
+    let simulatedFirebase;
+    return (simulationQueue = simulationQueue.catch(() => {}).then(() => {
+      simulationConsoleLogs = [];
+      simulatedFirebase = createRef(url, null, 'permission_denied_simulator');
+      simulatedFirebase.unauth();
+      return simulatedFirebase.authWithCustomToken(token, function() {}, {remember: 'none'});
+    }).then(() => {
+      return simulatedFirebase[method].apply(simulatedFirebase, args);
+    }).then(() => {
+      return null;
+    }, e => {
+      const code = e.code || e.message;
+      if (code && code.toLowerCase() === 'permission_denied') {
+        return simulationConsoleLogs.join('\n');
+      } else {
+        return 'Got a different error in simulation: ' + e;
+      }
+    }));
+  }
+
   static expose(fn) {
     if (Fireworker._exposed.hasOwnProperty(fn.name)) {
       throw new Error(`Function ${fn.name}() already exposed`);
@@ -302,6 +325,41 @@ class Fireworker {
 Fireworker._exposed = {};
 Fireworker._firstMessageReceived = false;
 
+
+function interceptConsoleLog() {
+  if (consoleIntercepted) return;
+  const originalLog = console.log;
+  let lastTestIndex;
+  console.log = function() {
+    let message = Array.prototype.join.call(arguments, ' ');
+    if (!/^(FIREBASE: \n?)+/.test(message)) return originalLog.apply(console, arguments);
+    message = message
+      .replace(/^(FIREBASE: \n?)+/, '')
+      .replace(/^\s+([^.]*):(?:\.(read|write|validate):)?.*/g, function(match, g1, g2) {
+        g2 = g2 || 'read';
+        return ' ' + g2 + ' ' + g1;
+      });
+    if (/^\s+/.test(message)) {
+      const match = message.match(/^\s+=> (true|false)/);
+      if (match) {
+        simulationConsoleLogs[lastTestIndex] =
+          (match[1] === 'true' ? ' \u2713' : ' \u2717') + simulationConsoleLogs[lastTestIndex];
+        lastTestIndex = undefined;
+      } else {
+        if (lastTestIndex === simulationConsoleLogs.length - 1) simulationConsoleLogs.pop();
+        simulationConsoleLogs.push(message);
+        lastTestIndex = simulationConsoleLogs.length - 1;
+      }
+    } else if (/^\d+:\d+: /.test(message)) {
+      simulationConsoleLogs.push('   ' + message);
+    } else {
+      if (lastTestIndex === simulationConsoleLogs.length - 1) simulationConsoleLogs.pop();
+      simulationConsoleLogs.push(message);
+      lastTestIndex = undefined;
+    }
+  };
+  consoleIntercepted = true;
+}
 
 function errorToJson(error) {
   const json = {name: error.name};
@@ -332,9 +390,9 @@ function snapshotToJson(snapshot, options) {
   }
 }
 
-function createRef(url, terms) {
+function createRef(url, terms, context) {
   try {
-    let ref = new Firebase(url);
+    let ref = new Firebase(url, context);
     if (terms) {
       for (let term of terms) ref = ref[term[0]].apply(ref, term.slice(1));
     }

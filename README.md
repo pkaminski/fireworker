@@ -94,6 +94,17 @@ The callback will be invoked with three arguments:
 - `delta`, which indicates whether the count just increased or decreased with +1 and -1 respectively.
 - `timeout`, the timeout value specified for this handler.
 
+### Permission denied debugging
+You can have any operations that failed due to a permission denied error retried automatically to provide more details about which security rule failed.  The details are attached to the `error` as `error.extra.debug`.  You'll need to have a server to issue a special short-term auth token with the `simulated` and `debug` flags set.  To set this up, call `Firebase.debugPermissionDeniedErrors(simulatedTokenGenerator, maxSimulationDuration, callFilter)` with:
+- `simulatedTokenGenerator`, a function that given a `uid` returns a promise that resolve to a Firebase auth token for that user with `simulated` and `debug` set to true.  You can generate such a token in Node.js like this, for example:
+```js
+const FirebaseTokenGenerator = require('firebase-token-generator');
+const tokenGenerator = new FirebaseTokenGenerator('<YOUR_FIREBASE_SECRET>');
+const token = tokenGenerator.createToken({uid: uid}, {simulate: true, debug: true});
+```
+- `maxSimulationDuration`, the maximum duration in milliseconds to allow for the debug token to be issued and the simulated call(s) to complete.  The callback and promise on the original failing call won't be resolved until the simulation finishes one way or another.  Defaults to 5 seconds.
+- `callFilter`, a function that decides which "permission denied" failed calls to debug.  It gets passed the method name (which may not match the original you called precisely, e.g. `remove` and `push` both show up as `set`) and the url, and returns true to simulate the call.  Returns true by default.
+
 ### Custom worker functions
 Sometimes you need to augment the worker directly with extra code that needs to run on the original Firebase SDK (e.g., [Firecrypt](https://github.com/pkaminski/firecrypt)), and expose some means of configuring or controlling this code to the client.  You can do this calling `Fireworker.expose(myCustomFunction)` for each function you'd like to make callable from the client; you must do this before any client has connected &mdash; basically when the worker script is loading.
 

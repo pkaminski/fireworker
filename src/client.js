@@ -224,7 +224,7 @@ class Firebase extends Query {
   constructor(url) {
     // TODO: support additional undocumented "environment" argument
     super(url);
-    worker.trackServer(this.root()._url);
+    worker.trackServer(getUrlRoot(url));
   }
 
   authWithCustomToken(authToken, onComplete, options) {
@@ -270,15 +270,15 @@ class Firebase extends Query {
   }
 
   onAuth(onComplete, context) {
-    worker.onAuth(this.root()._url, onComplete, context);
+    worker.onAuth(getUrlRoot(this._url), onComplete, context);
   }
 
   offAuth(onComplete, context) {
-    worker.offAuth(this.root()._url, onComplete, context);
+    worker.offAuth(getUrlRoot(this._url), onComplete, context);
   }
 
   getAuth() {
-    return worker.getAuth(this.root()._url);
+    return worker.getAuth(getUrlRoot(this._url));
   }
 
   child(childPath) {
@@ -291,8 +291,8 @@ class Firebase extends Query {
   }
 
   root() {
-    const k = this._url.indexOf('/', 8);
-    return k >= 8 ? new Firebase(this._url.slice(0, k)) : this;
+    const rootUrl = getUrlRoot(this._url);
+    return this._url === rootUrl ? this : new Firebase(rootUrl);
   }
 
   key() {
@@ -407,7 +407,10 @@ class Firebase extends Query {
     }
   }
 
-  // TODO: add debugPermissionDeniedErrors
+  static debugPermissionDeniedErrors(simulatedTokenGenerator, maxSimulationDuration, callFilter) {
+    return worker.debugPermissionDeniedErrors(
+      simulatedTokenGenerator, maxSimulationDuration, callFilter);
+  }
 }
 
 Firebase.ServerValue = Object.freeze({TIMESTAMP: Object.freeze({'.sv': 'timestamp'})});
@@ -452,6 +455,9 @@ class FirebaseWorker {
     this._active = true;
     this._servers = {};
     this._callbacks = {};
+    this._simulatedTokenGenerator = null;
+    this._maxSimulationDuration = 5000;
+    this._simulatedCallFilter = null;
     this._inboundMessages = [];
     this._outboundMessages = [];
     this._flushMessageQueue = this._flushMessageQueue.bind(this);
@@ -495,12 +501,20 @@ class FirebaseWorker {
     }
   }
 
+  debugPermissionDeniedErrors(simulatedTokenGenerator, maxSimulationDuration, callFilter) {
+    this._simulatedTokenGenerator = simulatedTokenGenerator;
+    if (maxSimulationDuration !== undefined) this._maxSimulationDuration = maxSimulationDuration;
+    this._simulatedCallFilter = callFilter || function() {return true;};
+  }
+
   _send(message) {
     message.id = ++this._idCounter;
     const promise = new Promise((resolve, reject) => {
       this._deferreds[message.id] = {resolve, reject};
     });
-    this._deferreds[message.id].promise = promise;
+    const deferred = this._deferreds[message.id];
+    deferred.promise = promise;
+    for (let name in message) if (message.hasOwnProperty(name)) deferred[name] = message[name];
     if (!this._outboundMessages.length && this._active) setImmediate(this._flushMessageQueue);
     this._outboundMessages.push(message);
     return promise;
@@ -546,9 +560,75 @@ class FirebaseWorker {
     const deferred = this._deferreds[message.id];
     if (!deferred) throw new Error('fireworker received rejection of inexistent call');
     delete this._deferreds[message.id];
-    const error = errorFromJson(message.error);
-    deferred.reject(error);
-    emitError(error);
+    this._hydrateError(message.error, deferred).then(error => {
+      deferred.reject(error);
+      emitError(error);
+    });
+  }
+
+  _hydrateError(json, props) {
+    if (!json || json instanceof Error) return Promise.resolve(json);
+    // console.log(json);
+    const error = new Error();
+    for (let propertyName in json) {
+      if (!json.hasOwnProperty(propertyName)) continue;
+      error[propertyName] = json[propertyName];
+    }
+    const code = json.code || json.message;
+    if (code && code.toLowerCase() === 'permission_denied') {
+      return this._simulateCall(props).then(securityTrace => {
+        if (securityTrace) {
+          error.extra = error.extra || {};
+          error.extra.debug = securityTrace;
+        }
+        return error;
+      });
+    } else {
+      return Promise.resolve(error);
+    }
+  }
+
+  _simulateCall(props) {
+    if (!(this._simulatedTokenGenerator && this._maxSimulationDuration > 0)) {
+      return Promise.resolve();
+    }
+    let simulatedCalls = [];
+    switch (props.msg) {
+      case 'set':
+      case 'update':
+        simulatedCalls.push({method: 'set', url: props.url, args: [props.value]});
+        break;
+      case 'on':
+      case 'once':
+        simulatedCalls.push({method: 'once', url: props.url, args: ['value']});
+        break;
+      case 'transaction':
+        simulatedCalls.push({method: 'once', url: props.url, args: ['value']});
+        simulatedCalls.push({method: 'set', url: props.url, args: [props.newValue]});
+        break;
+    }
+    if (!simulatedCalls.length || !this._simulatedCallFilter(props.msg, props.url)) {
+      return Promise.resolve();
+    }
+    const auth = this.getAuth(getUrlRoot(props.url));
+    const simulationPromise = this._simulatedTokenGenerator(auth && auth.uid).then(token => {
+      return Promise.all(simulatedCalls.map(message => {
+        message.msg = 'simulate';
+        message.token = token;
+        return this._send(message);
+      }));
+    }).then(securityTraces => {
+      if (securityTraces.every(trace => trace === null)) {
+        return 'Unable to reproduce error in simulation';
+      }
+      return securityTraces.filter(trace => trace).join('\n\n');
+    }).catch(e => {
+      return 'Error running simulation: ' + e;
+    });
+    const timeoutPromise = new Promise(resolve => {
+      setTimeout(resolve.bind(null, 'Simulated call timed out'), this._maxSimulationDuration);
+    });
+    return Promise.race([simulationPromise, timeoutPromise]);
   }
 
   updateLocalStorage(items) {
@@ -660,7 +740,7 @@ class FirebaseWorker {
 
   on(listenerKey, url, terms, eventType, snapshotCallback, cancelCallback, context, options) {
     const handle = {
-      listenerKey, eventType, snapshotCallback, cancelCallback, context,
+      listenerKey, eventType, snapshotCallback, cancelCallback, context, msg: 'on', url, terms,
       timeouts: slowCallbacks.read.map(record => new SlownessTracker(record))
     };
     const callback = this._onCallback.bind(this, handle);
@@ -722,9 +802,10 @@ class FirebaseWorker {
     }
     if (error) {
       this._deregisterCallback(handle.id);
-      error = errorFromJson(error);
-      if (handle.cancelCallback) handle.cancelCallback.call(handle.context, error);
-      emitError(error);
+      this._hydrateError(error, handle).then(error => {
+        if (handle.cancelCallback) handle.cancelCallback.call(handle.context, error);
+        emitError(error);
+      });
     } else {
       handle.snapshotCallback.call(handle.context, new Snapshot(snapshotJson));
     }
@@ -829,23 +910,17 @@ function trackSlowness(promise, operationKind) {
   return promise;
 }
 
-function errorFromJson(json) {
-  if (!json || json instanceof Error) return json;
-  // console.log(json);
-  const error = new Error();
-  for (let propertyName in json) {
-    if (!json.hasOwnProperty(propertyName)) continue;
-    error[propertyName] = json[propertyName];
-  }
-  return error;
-}
-
 function emitError(error) {
   if (errorCallbacks.length) {
     setTimeout(() => {
       for (let callback of errorCallbacks) callback(error);
     }, 0);
   }
+}
+
+function getUrlRoot(url) {
+  const k = url.indexOf('/', 8);
+  return k >= 8 ? url.slice(0, k) : url;
 }
 
 function noop() {}
