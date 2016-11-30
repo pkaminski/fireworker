@@ -309,14 +309,9 @@ Fireworker.prototype.off = function off (ref) {
 };
 
 Fireworker.prototype._onSnapshotCallback = function _onSnapshotCallback (callbackId, options, snapshot) {
-  try {
-    this._send({
-      msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
-    });
-  } catch (e) {
-    this._callbacks[callbackId].cancel();
-    this._send({msg: 'callback', id: callbackId, args: [errorToJson(e)]});
-  }
+  this._send({
+    msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
+  });
 };
 
 Fireworker.prototype._onCancelCallback = function _onCancelCallback (callbackId, error) {
@@ -468,18 +463,25 @@ function snapshotToJson(snapshot, options) {
   if (options && options.omitValue) {
     return {url: url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren()};
   } else {
-    var value = snapshot.val();
-    var childrenKeys;
-    if (options && options.orderChildren && typeof value === 'object') {
-      for (var key in value) {
-        if (!value.hasOwnProperty(key)) { continue; }
-        // Non-enumerable properties won't be transmitted when sending.
-        Object.defineProperty(value[key], '$key', {value: key});
+    try {
+      var value = snapshot.val();
+      var childrenKeys;
+      if (options && options.orderChildren && typeof value === 'object') {
+        for (var key in value) {
+          if (!value.hasOwnProperty(key)) { continue; }
+          // Non-enumerable properties won't be transmitted when sending.
+          Object.defineProperty(value[key], '$key', {value: key});
+        }
+        childrenKeys = [];
+        snapshot.forEach(function (child) {childrenKeys.push(child.$key);});
       }
-      childrenKeys = [];
-      snapshot.forEach(function (child) {childrenKeys.push(child.$key);});
+      return {url: url, value: value, childrenKeys: childrenKeys};
+    } catch (e) {
+      return {
+        url: url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren(),
+        valueError: errorToJson(e)
+      };
     }
-    return {url: url, value: value, childrenKeys: childrenKeys};
   }
 }
 

@@ -15,12 +15,14 @@ var Snapshot = function Snapshot(ref) {
   var url = ref.url;
   var childrenKeys = ref.childrenKeys;
   var value = ref.value;
+  var valueError = ref.valueError;
   var exists = ref.exists;
   var hasChildren = ref.hasChildren;
 
   this._url = url.replace(/\/$/, '');
   this._childrenKeys = childrenKeys;
   this._value = value;
+  this._valueError = errorFromJson(valueError);
   this._exists = value === undefined ? exists || false : value !== null;
   this._hasChildren = typeof value === 'object' || hasChildren || false;
 };
@@ -114,6 +116,7 @@ Snapshot.prototype.ref = function ref () {
 };
 
 Snapshot.prototype._checkValue = function _checkValue () {
+  if (this._valueError) { throw this._valueError; }
   if (this._value === undefined) { throw new Error('Value omitted from snapshot'); }
 };
 
@@ -599,13 +602,7 @@ FirebaseWorker.prototype.reject = function reject (message) {
 };
 
 FirebaseWorker.prototype._hydrateError = function _hydrateError (json, props) {
-  if (!json || json instanceof Error) { return Promise.resolve(json); }
-  // console.log(json);
-  var error = new Error();
-  for (var propertyName in json) {
-    if (!json.hasOwnProperty(propertyName)) { continue; }
-    error[propertyName] = json[propertyName];
-  }
+  var error = errorFromJson(json);
   var code = json.code || json.message;
   if (code && code.toLowerCase() === 'permission_denied') {
     return this._simulateCall(props).then(function (securityTrace) {
@@ -974,6 +971,16 @@ function trackSlowness(promise, operationKind) {
   });
 
   return promise;
+}
+
+function errorFromJson(json) {
+  if (!json || json instanceof Error) { return json; }
+  var error = new Error();
+  for (var propertyName in json) {
+    if (!json.hasOwnProperty(propertyName)) { continue; }
+    error[propertyName] = json[propertyName];
+  }
+  return error;
 }
 
 function emitError(error) {
