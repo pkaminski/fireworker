@@ -12,10 +12,11 @@ const MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
 
 
 class Snapshot {
-  constructor({url, childrenKeys, value, exists, hasChildren}) {
+  constructor({url, childrenKeys, value, valueError, exists, hasChildren}) {
     this._url = url.replace(/\/$/, '');
     this._childrenKeys = childrenKeys;
     this._value = value;
+    this._valueError = errorFromJson(valueError);
     this._exists = value === undefined ? exists || false : value !== null;
     this._hasChildren = typeof value === 'object' || hasChildren || false;
   }
@@ -103,6 +104,7 @@ class Snapshot {
   }
 
   _checkValue() {
+    if (this._valueError) throw this._valueError;
     if (this._value === undefined) throw new Error('Value omitted from snapshot');
   }
 
@@ -567,13 +569,7 @@ class FirebaseWorker {
   }
 
   _hydrateError(json, props) {
-    if (!json || json instanceof Error) return Promise.resolve(json);
-    // console.log(json);
-    const error = new Error();
-    for (let propertyName in json) {
-      if (!json.hasOwnProperty(propertyName)) continue;
-      error[propertyName] = json[propertyName];
-    }
+    const error = errorFromJson(json);
     const code = json.code || json.message;
     if (code && code.toLowerCase() === 'permission_denied') {
       return this._simulateCall(props).then(securityTrace => {
@@ -908,6 +904,16 @@ function trackSlowness(promise, operationKind) {
   });
 
   return promise;
+}
+
+function errorFromJson(json) {
+  if (!json || json instanceof Error) return json;
+  const error = new Error();
+  for (let propertyName in json) {
+    if (!json.hasOwnProperty(propertyName)) continue;
+    error[propertyName] = json[propertyName];
+  }
+  return error;
 }
 
 function emitError(error) {

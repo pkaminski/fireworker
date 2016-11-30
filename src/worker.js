@@ -243,14 +243,9 @@ class Fireworker {
   }
 
   _onSnapshotCallback(callbackId, options, snapshot) {
-    try {
-      this._send({
-        msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
-      });
-    } catch (e) {
-      this._callbacks[callbackId].cancel();
-      this._send({msg: 'callback', id: callbackId, args: [errorToJson(e)]});
-    }
+    this._send({
+      msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
+    });
   }
 
   _onCancelCallback(callbackId, error) {
@@ -382,18 +377,25 @@ function snapshotToJson(snapshot, options) {
   if (options && options.omitValue) {
     return {url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren()};
   } else {
-    const value = snapshot.val();
-    let childrenKeys;
-    if (options && options.orderChildren && typeof value === 'object') {
-      for (let key in value) {
-        if (!value.hasOwnProperty(key)) continue;
-        // Non-enumerable properties won't be transmitted when sending.
-        Object.defineProperty(value[key], '$key', {value: key});
+    try {
+      const value = snapshot.val();
+      let childrenKeys;
+      if (options && options.orderChildren && typeof value === 'object') {
+        for (let key in value) {
+          if (!value.hasOwnProperty(key)) continue;
+          // Non-enumerable properties won't be transmitted when sending.
+          Object.defineProperty(value[key], '$key', {value: key});
+        }
+        childrenKeys = [];
+        snapshot.forEach(child => {childrenKeys.push(child.$key);});
       }
-      childrenKeys = [];
-      snapshot.forEach(child => {childrenKeys.push(child.$key);});
+      return {url, value, childrenKeys};
+    } catch (e) {
+      return {
+        url, exists: snapshot.exists(), hasChildren: snapshot.hasChildren(),
+        valueError: errorToJson(e)
+      };
     }
-    return {url, value, childrenKeys};
   }
 }
 
