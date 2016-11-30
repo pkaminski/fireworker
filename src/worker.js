@@ -218,7 +218,7 @@ class Fireworker {
       this._onSnapshotCallback.bind(this, callbackId, options);
     snapshotCallback.listenerKey = listenerKey;
     snapshotCallback.eventType = eventType;
-    snapshotCallback.cancel = this.off.bind({listenerKey, url, terms, eventType, callbackId});
+    snapshotCallback.cancel = this.off.bind(this, {listenerKey, url, terms, eventType, callbackId});
     const cancelCallback = this._onCancelCallback.bind(this, callbackId);
     createRef(url, terms).on(eventType, snapshotCallback, cancelCallback);
   }
@@ -243,7 +243,14 @@ class Fireworker {
   }
 
   _onSnapshotCallback(callbackId, options, snapshot) {
-    this._send({msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]});
+    try {
+      this._send({
+        msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
+      });
+    } catch (e) {
+      this._callbacks[callbackId].cancel();
+      this._send({msg: 'callback', id: callbackId, args: [errorToJson(e)]});
+    }
   }
 
   _onCancelCallback(callbackId, error) {
