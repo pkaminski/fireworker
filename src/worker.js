@@ -159,7 +159,7 @@ class Fireworker {
 
   call({name, args}) {
     try {
-      return Promise.resolve(this._exposed[name].apply(null, args));
+      return Promise.resolve(Fireworker._exposed[name].apply(null, args));
     } catch (e) {
       return Promise.reject(e);
     }
