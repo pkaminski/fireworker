@@ -275,7 +275,7 @@ Fireworker.prototype.on = function on (ref) {
     this._onSnapshotCallback.bind(this, callbackId, options);
   snapshotCallback.listenerKey = listenerKey;
   snapshotCallback.eventType = eventType;
-  snapshotCallback.cancel = this.off.bind({listenerKey: listenerKey, url: url, terms: terms, eventType: eventType, callbackId: callbackId});
+  snapshotCallback.cancel = this.off.bind(this, {listenerKey: listenerKey, url: url, terms: terms, eventType: eventType, callbackId: callbackId});
   var cancelCallback = this._onCancelCallback.bind(this, callbackId);
   createRef(url, terms).on(eventType, snapshotCallback, cancelCallback);
 };
@@ -309,7 +309,14 @@ Fireworker.prototype.off = function off (ref) {
 };
 
 Fireworker.prototype._onSnapshotCallback = function _onSnapshotCallback (callbackId, options, snapshot) {
-  this._send({msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]});
+  try {
+    this._send({
+      msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
+    });
+  } catch (e) {
+    this._callbacks[callbackId].cancel();
+    this._send({msg: 'callback', id: callbackId, args: [errorToJson(e)]});
+  }
 };
 
 Fireworker.prototype._onCancelCallback = function _onCancelCallback (callbackId, error) {
