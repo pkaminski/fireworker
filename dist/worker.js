@@ -4,6 +4,7 @@
 /* globals Firebase, CryptoJS, setImmediate, setInterval, self */
 
 var fireworkers = [];
+var simulationQueue = Promise.resolve(), consoleIntercepted = false, simulationConsoleLogs;
 
 
 var LocalStorage = function LocalStorage() {
@@ -129,6 +130,11 @@ Fireworker.prototype.destroy = function destroy () {
 
 Fireworker.prototype.ping = function ping () {
   this.lastTouched = Date.now();
+};
+
+Fireworker.prototype.bounceConnection = function bounceConnection () {
+  Firebase.goOffline();
+  Firebase.goOnline();
 };
 
 Fireworker.prototype._receive = function _receive (event) {
@@ -354,6 +360,42 @@ Fireworker.prototype.transaction = function transaction (ref$1) {
   });
 };
 
+Fireworker.prototype.onDisconnect = function onDisconnect (ref) {
+    var url = ref.url;
+    var method = ref.method;
+    var value = ref.value;
+
+  var onDisconnect = createRef(url).onDisconnect();
+  return onDisconnect[method].call(onDisconnect, value);
+};
+
+Fireworker.prototype.simulate = function simulate (ref) {
+    var token = ref.token;
+    var method = ref.method;
+    var url = ref.url;
+    var args = ref.args;
+
+  interceptConsoleLog();
+  var simulatedFirebase;
+  return (simulationQueue = simulationQueue.catch(function () {}).then(function () {
+    simulationConsoleLogs = [];
+    simulatedFirebase = createRef(url, null, 'permission_denied_simulator');
+    simulatedFirebase.unauth();
+    return simulatedFirebase.authWithCustomToken(token, function() {}, {remember: 'none'});
+  }).then(function () {
+    return simulatedFirebase[method].apply(simulatedFirebase, args);
+  }).then(function () {
+    return null;
+  }, function (e) {
+    var code = e.code || e.message;
+    if (code && code.toLowerCase() === 'permission_denied') {
+      return simulationConsoleLogs.join('\n');
+    } else {
+      return 'Got a different error in simulation: ' + e;
+    }
+  }));
+};
+
 Fireworker.expose = function expose (fn) {
   if (Fireworker._exposed.hasOwnProperty(fn.name)) {
     throw new Error(("Function " + (fn.name) + "() already exposed"));
@@ -367,6 +409,41 @@ Fireworker.expose = function expose (fn) {
 Fireworker._exposed = {};
 Fireworker._firstMessageReceived = false;
 
+
+function interceptConsoleLog() {
+  if (consoleIntercepted) { return; }
+  var originalLog = console.log;
+  var lastTestIndex;
+  console.log = function() {
+    var message = Array.prototype.join.call(arguments, ' ');
+    if (!/^(FIREBASE: \n?)+/.test(message)) { return originalLog.apply(console, arguments); }
+    message = message
+      .replace(/^(FIREBASE: \n?)+/, '')
+      .replace(/^\s+([^.]*):(?:\.(read|write|validate):)?.*/g, function(match, g1, g2) {
+        g2 = g2 || 'read';
+        return ' ' + g2 + ' ' + g1;
+      });
+    if (/^\s+/.test(message)) {
+      var match = message.match(/^\s+=> (true|false)/);
+      if (match) {
+        simulationConsoleLogs[lastTestIndex] =
+          (match[1] === 'true' ? ' \u2713' : ' \u2717') + simulationConsoleLogs[lastTestIndex];
+        lastTestIndex = undefined;
+      } else {
+        if (lastTestIndex === simulationConsoleLogs.length - 1) { simulationConsoleLogs.pop(); }
+        simulationConsoleLogs.push(message);
+        lastTestIndex = simulationConsoleLogs.length - 1;
+      }
+    } else if (/^\d+:\d+: /.test(message)) {
+      simulationConsoleLogs.push('   ' + message);
+    } else {
+      if (lastTestIndex === simulationConsoleLogs.length - 1) { simulationConsoleLogs.pop(); }
+      simulationConsoleLogs.push(message);
+      lastTestIndex = undefined;
+    }
+  };
+  consoleIntercepted = true;
+}
 
 function errorToJson(error) {
   var json = {name: error.name};
@@ -399,9 +476,9 @@ function snapshotToJson(snapshot, options) {
   }
 }
 
-function createRef(url, terms) {
+function createRef(url, terms, context) {
   try {
-    var ref = new Firebase(url);
+    var ref = new Firebase(url, context);
     if (terms) {
       for (var i = 0, list = terms; i < list.length; i += 1) {
         var term = list[i];

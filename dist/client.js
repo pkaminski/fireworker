@@ -1,10 +1,11 @@
 (function() {
 'use strict';
 
-/* globals window, setImmediate, setTimeout, setInterval */
+/* globals window, setImmediate, setTimeout, clearTimeout, setInterval */
 
 var worker;
 var errorCallbacks = [];
+var slowCallbacks = {read: [], write: [], auth: [], onDisconnect: []};
 
 var ALPHABET = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
 var MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
@@ -129,6 +130,27 @@ Snapshot.prototype._getChildValue = function _getChildValue (childPathParts) {
   return result;
 };
 
+var OnDisconnect = function OnDisconnect(url) {
+  this._url = url;
+};
+
+OnDisconnect.prototype.set = function set (value, onComplete) {
+  return attachCallback(worker.onDisconnect(this._url, 'set', value), onComplete, 'onDisconnect');
+};
+
+OnDisconnect.prototype.update = function update (value, onComplete) {
+  return attachCallback(
+    worker.onDisconnect(this._url, 'update', value), onComplete, 'onDisconnect');
+};
+
+OnDisconnect.prototype.remove = function remove (onComplete) {
+  return attachCallback(worker.onDisconnect(this._url, 'remove'), onComplete, 'onDisconnect');
+};
+
+OnDisconnect.prototype.cancel = function cancel (onComplete) {
+  return attachCallback(worker.onDisconnect(this._url, 'cancel'), onComplete, 'onDisconnect');
+};
+
 var Query = function Query(url, terms) {
   if (!worker) { throw new Error('Worker not connected'); }
   if (url.slice(0, 8) !== 'https://') { throw new Error('Firebase URL must start with "https://"'); }
@@ -157,9 +179,16 @@ Query.prototype.once = function once (eventType, successCallback, failureCallbac
     context = failureCallback;
     failureCallback = undefined;
   }
-  return worker.once(
-    this._url, this._terms, eventType, successCallback, failureCallback, context,
-    {omitValue: !!(successCallback && successCallback.omitSnapshotValue)});
+  return trackSlowness(worker.once(
+    this._url, this._terms, eventType,
+    {omitValue: !!(successCallback && successCallback.omitSnapshotValue)}
+  ), 'read').then(function (snapshot) {
+    if (successCallback) { successCallback.call(context, snapshot); }
+    return snapshot;
+  }, function (error) {
+    if (failureCallback) { failureCallback.call(context, error); }
+    return Promise.reject(error);
+  });
 };
 
 Query.prototype.ref = function ref () {
@@ -202,7 +231,7 @@ var Firebase = (function (Query) {
   function Firebase(url) {
     // TODO: support additional undocumented "environment" argument
     Query.call(this, url);
-    worker.trackServer(this.root()._url);
+    worker.trackServer(getUrlRoot(url));
   }
 
   if ( Query ) Firebase.__proto__ = Query;
@@ -214,7 +243,8 @@ var Firebase = (function (Query) {
       options = onComplete;
       onComplete = null;
     }
-    return attachCallback(worker.authWithCustomToken(this._url, authToken, options), onComplete);
+    return attachCallback(
+      worker.authWithCustomToken(this._url, authToken, options), onComplete, 'auth');
   };
 
   Firebase.prototype.authAnonymously = function authAnonymously (onComplete, options) {
@@ -222,7 +252,7 @@ var Firebase = (function (Query) {
       options = onComplete;
       onComplete = null;
     }
-    return attachCallback(worker.authAnonymously(this._url, options), onComplete);
+    return attachCallback(worker.authAnonymously(this._url, options), onComplete, 'auth');
   };
 
   Firebase.prototype.authWithOAuthToken = function authWithOAuthToken (provider, credentials, onComplete, options) {
@@ -231,7 +261,7 @@ var Firebase = (function (Query) {
       onComplete = null;
     }
     return attachCallback(
-      worker.authWithCustomToken(this._url, provider, credentials, options), onComplete);
+      worker.authWithCustomToken(this._url, provider, credentials, options), onComplete, 'auth');
   };
 
   Firebase.prototype.authWithPassword = function authWithPassword () {
@@ -251,15 +281,15 @@ var Firebase = (function (Query) {
   };
 
   Firebase.prototype.onAuth = function onAuth (onComplete, context) {
-    worker.onAuth(this.root()._url, onComplete, context);
+    worker.onAuth(getUrlRoot(this._url), onComplete, context);
   };
 
   Firebase.prototype.offAuth = function offAuth (onComplete, context) {
-    worker.offAuth(this.root()._url, onComplete, context);
+    worker.offAuth(getUrlRoot(this._url), onComplete, context);
   };
 
   Firebase.prototype.getAuth = function getAuth () {
-    return worker.getAuth(this.root()._url);
+    return worker.getAuth(getUrlRoot(this._url));
   };
 
   Firebase.prototype.child = function child (childPath) {
@@ -272,8 +302,8 @@ var Firebase = (function (Query) {
   };
 
   Firebase.prototype.root = function root () {
-    var k = this._url.indexOf('/', 8);
-    return k >= 8 ? new Firebase(this._url.slice(0, k)) : this;
+    var rootUrl = getUrlRoot(this._url);
+    return this._url === rootUrl ? this : new Firebase(rootUrl);
   };
 
   Firebase.prototype.key = function key () {
@@ -281,15 +311,15 @@ var Firebase = (function (Query) {
   };
 
   Firebase.prototype.set = function set (value, onComplete) {
-    return attachCallback(worker.set(this._url, value), onComplete);
+    return attachCallback(worker.set(this._url, value), onComplete, 'write');
   };
 
   Firebase.prototype.update = function update (value, onComplete) {
-    return attachCallback(worker.update(this._url, value), onComplete);
+    return attachCallback(worker.update(this._url, value), onComplete, 'write');
   };
 
   Firebase.prototype.remove = function remove (onComplete) {
-    return attachCallback(worker.set(this._url, null), onComplete);
+    return attachCallback(worker.set(this._url, null), onComplete, 'write');
   };
 
   Firebase.prototype.push = function push (value, onComplete) {
@@ -318,7 +348,9 @@ var Firebase = (function (Query) {
     // Hold the ref value live until transaction complete, otherwise it'll keep retrying on a null
     // value.
     this.on('value', noop);  // No error handling -- if this fails, so will the transaction.
-    return worker.transaction(this._url, updateFunction, options).then(function (result) {
+    return trackSlowness(
+      worker.transaction(this._url, updateFunction, options), 'write'
+    ).then(function (result) {
       this$1.off('value', noop);
       if (onComplete) { onComplete(null, result.committed, result.snapshot); }
       return result;
@@ -327,6 +359,10 @@ var Firebase = (function (Query) {
       if (onComplete) { onComplete(error); }
       return Promise.reject(error);
     });
+  };
+
+  Firebase.prototype.onDisconnect = function onDisconnect () {
+    return new OnDisconnect(this._url);
   };
 
   Firebase.connectWorker = function connectWorker (webWorker) {
@@ -340,11 +376,15 @@ var Firebase = (function (Query) {
   };
 
   Firebase.goOnline = function goOnline () {
-    throw new Error('Global goOnline() call must be made from within the worker process');
+    worker.activate(true);
   };
 
   Firebase.goOffline = function goOffline () {
-    throw new Error('Global goOffline() call must be made from within the worker process');
+    worker.activate(false);
+  };
+
+  Firebase.bounceConnection = function bounceConnection () {
+    return worker.bounceConnection();
   };
 
   Firebase.enableLogging = function enableLogging () {
@@ -361,6 +401,36 @@ var Firebase = (function (Query) {
     if (k !== -1) { errorCallbacks.splice(k, 1); }
   };
 
+  Firebase.onSlow = function onSlow (operationKind, timeout, callback) {
+    var kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
+    for (var i = 0, list = kinds; i < list.length; i += 1) {
+      var kind = list[i];
+
+      slowCallbacks[kind].push({timeout: timeout, callback: callback, count: 0});
+    }
+    return callback;
+  };
+
+  Firebase.offSlow = function offSlow (operationKind, callback) {
+    var kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
+    for (var i$1 = 0, list = kinds; i$1 < list.length; i$1 += 1) {
+      var kind = list[i$1];
+
+      var records = slowCallbacks[kind];
+      for (var i = 0; i < records.length; i++) {
+        if (records[i].callback === callback) {
+          records.splice(i, 1);
+          break;
+        }
+      }
+    }
+  };
+
+  Firebase.debugPermissionDeniedErrors = function debugPermissionDeniedErrors (simulatedTokenGenerator, maxSimulationDuration, callFilter) {
+    return worker.debugPermissionDeniedErrors(
+      simulatedTokenGenerator, maxSimulationDuration, callFilter);
+  };
+
   return Firebase;
 }(Query));
 
@@ -372,16 +442,43 @@ Firebase.ABORT_TRANSACTION_NOW = Object.create(null);
 Firebase.worker = {};
 
 
+var SlownessTracker = function SlownessTracker(record) {
+  this.record = record;
+  this.counted = false;
+  this.canceled = false;
+  this.handle = setTimeout(this.handleTimeout.bind(this), record.timeout);
+};
+
+SlownessTracker.prototype.handleTimeout = function handleTimeout () {
+  if (this.canceled) { return; }
+  this.counted = true;
+  this.record.callback(++this.record.count, 1, this.record.timeout);
+};
+
+SlownessTracker.prototype.handleDone = function handleDone () {
+  this.canceled = true;
+  if (this.counted) {
+    this.record.callback(--this.record.count, -1, this.record.timeout);
+  } else {
+    clearTimeout(this.handle);
+  }
+};
+
+
 // jshint latedef:false
 var FirebaseWorker = function FirebaseWorker(webWorker) {
   var this$1 = this;
 
   this._idCounter = 0;
   this._deferreds = {};
-  this._online = true;
+  this._active = true;
   this._servers = {};
   this._callbacks = {};
-  this._messages = [];
+  this._simulatedTokenGenerator = null;
+  this._maxSimulationDuration = 5000;
+  this._simulatedCallFilter = null;
+  this._inboundMessages = [];
+  this._outboundMessages = [];
   this._flushMessageQueue = this._flushMessageQueue.bind(this);
   this._port = webWorker.port || webWorker;
   this._shared = !!webWorker.port;
@@ -420,6 +517,22 @@ FirebaseWorker.prototype.init = function init () {
   );
 };
 
+FirebaseWorker.prototype.activate = function activate (enabled) {
+  if (this._active === enabled) { return; }
+  this._active = enabled;
+  if (enabled) {
+    this._receiveMessages(this._inboundMessages);
+    this._inboundMessages = [];
+    if (this._outboundMessages.length) { setImmediate(this._flushMessageQueue); }
+  }
+};
+
+FirebaseWorker.prototype.debugPermissionDeniedErrors = function debugPermissionDeniedErrors (simulatedTokenGenerator, maxSimulationDuration, callFilter) {
+  this._simulatedTokenGenerator = simulatedTokenGenerator;
+  if (maxSimulationDuration !== undefined) { this._maxSimulationDuration = maxSimulationDuration; }
+  this._simulatedCallFilter = callFilter || function() {return true;};
+};
+
 FirebaseWorker.prototype._send = function _send (message) {
     var this$1 = this;
 
@@ -427,23 +540,33 @@ FirebaseWorker.prototype._send = function _send (message) {
   var promise = new Promise(function (resolve, reject) {
     this$1._deferreds[message.id] = {resolve: resolve, reject: reject};
   });
-  this._deferreds[message.id].promise = promise;
-  if (!this._messages.length) { setImmediate(this._flushMessageQueue); }
-  this._messages.push(message);
+  var deferred = this._deferreds[message.id];
+  deferred.promise = promise;
+  for (var name in message) { if (message.hasOwnProperty(name)) { deferred[name] = message[name]; } }
+  if (!this._outboundMessages.length && this._active) { setImmediate(this._flushMessageQueue); }
+  this._outboundMessages.push(message);
   return promise;
 };
 
 FirebaseWorker.prototype._flushMessageQueue = function _flushMessageQueue () {
-  // console.log('send', this._messages);
-  this._port.postMessage(this._messages);
-  this._messages = [];
+  // console.log('send', this._outboundMessages);
+  this._port.postMessage(this._outboundMessages);
+  this._outboundMessages = [];
 };
 
 FirebaseWorker.prototype._receive = function _receive (event) {
+  // console.log('receive', event.data);
+  if (this._active) {
+    this._receiveMessages(event.data);
+  } else {
+    this._inboundMessages = this._inboundMessages.concat(event.data);
+  }
+};
+
+FirebaseWorker.prototype._receiveMessages = function _receiveMessages (messages) {
     var this$1 = this;
 
-  // console.log('receive', event.data);
-  for (var i = 0, list = event.data; i < list.length; i += 1) {
+  for (var i = 0, list = messages; i < list.length; i += 1) {
     var message = list[i];
 
       var fn = this$1[message.msg];
@@ -469,9 +592,77 @@ FirebaseWorker.prototype.reject = function reject (message) {
   var deferred = this._deferreds[message.id];
   if (!deferred) { throw new Error('fireworker received rejection of inexistent call'); }
   delete this._deferreds[message.id];
-  var error = errorFromJson(message.error);
-  deferred.reject(error);
-  emitError(error);
+  this._hydrateError(message.error, deferred).then(function (error) {
+    deferred.reject(error);
+    emitError(error);
+  });
+};
+
+FirebaseWorker.prototype._hydrateError = function _hydrateError (json, props) {
+  if (!json || json instanceof Error) { return Promise.resolve(json); }
+  // console.log(json);
+  var error = new Error();
+  for (var propertyName in json) {
+    if (!json.hasOwnProperty(propertyName)) { continue; }
+    error[propertyName] = json[propertyName];
+  }
+  var code = json.code || json.message;
+  if (code && code.toLowerCase() === 'permission_denied') {
+    return this._simulateCall(props).then(function (securityTrace) {
+      if (securityTrace) {
+        error.extra = error.extra || {};
+        error.extra.debug = securityTrace;
+      }
+      return error;
+    });
+  } else {
+    return Promise.resolve(error);
+  }
+};
+
+FirebaseWorker.prototype._simulateCall = function _simulateCall (props) {
+    var this$1 = this;
+
+  if (!(this._simulatedTokenGenerator && this._maxSimulationDuration > 0)) {
+    return Promise.resolve();
+  }
+  var simulatedCalls = [];
+  switch (props.msg) {
+    case 'set':
+    case 'update':
+      simulatedCalls.push({method: 'set', url: props.url, args: [props.value]});
+      break;
+    case 'on':
+    case 'once':
+      simulatedCalls.push({method: 'once', url: props.url, args: ['value']});
+      break;
+    case 'transaction':
+      simulatedCalls.push({method: 'once', url: props.url, args: ['value']});
+      simulatedCalls.push({method: 'set', url: props.url, args: [props.newValue]});
+      break;
+  }
+  if (!simulatedCalls.length || !this._simulatedCallFilter(props.msg, props.url)) {
+    return Promise.resolve();
+  }
+  var auth = this.getAuth(getUrlRoot(props.url));
+  var simulationPromise = this._simulatedTokenGenerator(auth && auth.uid).then(function (token) {
+    return Promise.all(simulatedCalls.map(function (message) {
+      message.msg = 'simulate';
+      message.token = token;
+      return this$1._send(message);
+    }));
+  }).then(function (securityTraces) {
+    if (securityTraces.every(function (trace) { return trace === null; })) {
+      return 'Unable to reproduce error in simulation';
+    }
+    return securityTraces.filter(function (trace) { return trace; }).join('\n\n');
+  }).catch(function (e) {
+    return 'Error running simulation: ' + e;
+  });
+  var timeoutPromise = new Promise(function (resolve) {
+    setTimeout(resolve.bind(null, 'Simulated call timed out'), this$1._maxSimulationDuration);
+  });
+  return Promise.race([simulationPromise, timeoutPromise]);
 };
 
 FirebaseWorker.prototype.updateLocalStorage = function updateLocalStorage (items) {
@@ -586,7 +777,10 @@ FirebaseWorker.prototype.set = function set (url, value) {return this._send({msg
 FirebaseWorker.prototype.update = function update (url, value) {return this._send({msg: 'update', url: url, value: value});};
 
 FirebaseWorker.prototype.on = function on (listenerKey, url, terms, eventType, snapshotCallback, cancelCallback, context, options) {
-  var handle = {listenerKey: listenerKey, eventType: eventType, snapshotCallback: snapshotCallback, cancelCallback: cancelCallback, context: context};
+  var handle = {
+    listenerKey: listenerKey, eventType: eventType, snapshotCallback: snapshotCallback, cancelCallback: cancelCallback, context: context, msg: 'on', url: url, terms: terms,
+    timeouts: slowCallbacks.read.map(function (record) { return new SlownessTracker(record); })
+  };
   var callback = this._onCallback.bind(this, handle);
   this._registerCallback(callback, handle);
   // Keep multiple IDs to allow the same snapshotCallback to be reused.
@@ -653,24 +847,27 @@ FirebaseWorker.prototype.off = function off (listenerKey, url, terms, eventType,
 };
 
 FirebaseWorker.prototype._onCallback = function _onCallback (handle, error, snapshotJson) {
+  if (handle.timeouts) {
+    for (var i = 0, list = handle.timeouts; i < list.length; i += 1) {
+        var timeout = list[i];
+
+        timeout.handleDone();
+      }
+  }
   if (error) {
     this._deregisterCallback(handle.id);
-    error = errorFromJson(error);
-    if (handle.cancelCallback) { handle.cancelCallback.call(handle.context, error); }
-    emitError(error);
+    this._hydrateError(error, handle).then(function (error) {
+      if (handle.cancelCallback) { handle.cancelCallback.call(handle.context, error); }
+      emitError(error);
+    });
   } else {
     handle.snapshotCallback.call(handle.context, new Snapshot(snapshotJson));
   }
 };
 
-FirebaseWorker.prototype.once = function once (url, terms, eventType, successCallback, failureCallback, context, options) {
+FirebaseWorker.prototype.once = function once (url, terms, eventType, options) {
   return this._send({msg: 'once', url: url, terms: terms, eventType: eventType, options: options}).then(function (snapshotJson) {
-    var snapshot = new Snapshot(snapshotJson);
-    if (successCallback) { successCallback.call(context, snapshot); }
-    return snapshot;
-  }, function (error) {
-    if (failureCallback) { failureCallback.call(context, error); }
-    return Promise.reject(error);
+    return new Snapshot(snapshotJson);
   });
 };
 
@@ -703,6 +900,14 @@ FirebaseWorker.prototype.transaction = function transaction (url, updateFunction
   return attemptTransaction(null, null);
 };
 
+FirebaseWorker.prototype.onDisconnect = function onDisconnect (url, method, value) {
+  return this._send({msg: 'onDisconnect', url: url, method: method, value: value});
+};
+
+FirebaseWorker.prototype.bounceConnection = function bounceConnection () {
+  return this._send({msg: 'bounceConnection'});
+};
+
 FirebaseWorker.prototype.callback = function callback (ref) {
     var id = ref.id;
     var args = ref.args;
@@ -721,6 +926,14 @@ FirebaseWorker.prototype._registerCallback = function _registerCallback (callbac
 };
 
 FirebaseWorker.prototype._nullifyCallback = function _nullifyCallback (id) {
+  var handle = this._callbacks[id];
+  if (handle.timeouts) {
+    for (var i = 0, list = handle.timeouts; i < list.length; i += 1) {
+        var timeout = list[i];
+
+        timeout.handleDone();
+      }
+  }
   this._callbacks[id].callback = noop;
 };
 
@@ -729,20 +942,38 @@ FirebaseWorker.prototype._deregisterCallback = function _deregisterCallback (id)
 };
 
 
-function attachCallback(promise, onComplete) {
+function attachCallback(promise, onComplete, operationKind) {
+  promise = trackSlowness(promise, operationKind);
   if (!onComplete) { return promise; }
-  return promise.then(function (result) {onComplete(null, result);}, function (error) {onComplete(error);});
+  return promise.then(
+    function (result) {onComplete(null, result); return result;},
+    function (error) {onComplete(error); return Promise.reject(error);}
+  );
 }
 
-function errorFromJson(json) {
-  if (!json || json instanceof Error) { return json; }
-  console.log(json);
-  var error = new Error();
-  for (var propertyName in json) {
-    if (!json.hasOwnProperty(propertyName)) { continue; }
-    error[propertyName] = json[propertyName];
+function trackSlowness(promise, operationKind) {
+  var records = slowCallbacks[operationKind];
+  if (!records.length) { return promise; }
+
+  var timeouts = records.map(function (record) { return new SlownessTracker(record); });
+
+  function opDone() {
+    for (var i = 0, list = timeouts; i < list.length; i += 1) {
+      var timeout = list[i];
+
+      timeout.handleDone();
+    }
   }
-  return error;
+
+  promise = promise.then(function (result) {
+    opDone();
+    return result;
+  }, function (error) {
+    opDone();
+    return Promise.reject(error);
+  });
+
+  return promise;
 }
 
 function emitError(error) {
@@ -755,6 +986,11 @@ function emitError(error) {
       }
     }, 0);
   }
+}
+
+function getUrlRoot(url) {
+  var k = url.indexOf('/', 8);
+  return k >= 8 ? url.slice(0, k) : url;
 }
 
 function noop() {}
