@@ -313,15 +313,16 @@ class Fireworker {
     }));
   }
 
-  static expose(fn) {
-    if (!fn.name) throw new Error('Cannot expose a function with no name: ' + fn);
-    if (Fireworker._exposed.hasOwnProperty(fn.name)) {
-      throw new Error(`Function ${fn.name}() already exposed`);
+  static expose(fn, name) {
+    name = name || fn.name;
+    if (!name) throw new Error('Cannot expose a function with no name: ' + fn);
+    if (Fireworker._exposed.hasOwnProperty(name)) {
+      throw new Error(`Function ${name}() already exposed`);
     }
     if (Fireworker._firstMessageReceived) {
       throw new Error('Too late to expose function, worker in use');
     }
-    Fireworker._exposed[fn.name] = fn;
+    Fireworker._exposed[name] = fn;
   }
 }
 
