@@ -399,6 +399,7 @@ Fireworker.prototype.simulate = function simulate (ref) {
 };
 
 Fireworker.expose = function expose (fn) {
+  if (!fn.name) { throw new Error('Cannot expose a function with no name: ' + fn); }
   if (Fireworker._exposed.hasOwnProperty(fn.name)) {
     throw new Error(("Function " + (fn.name) + "() already exposed"));
   }
