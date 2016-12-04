@@ -834,7 +834,7 @@ FirebaseWorker.prototype.off = function off (listenerKey, url, terms, eventType,
 
       this$1._nullifyCallback(id$2);
     }
-  return this._send({msg: 'off', url: url, terms: terms, eventType: eventType, callbackId: callbackId}).then(function () {
+  return this._send({msg: 'off', listenerKey: listenerKey, url: url, terms: terms, eventType: eventType, callbackId: callbackId}).then(function () {
     for (var i = 0, list = idsToDeregister; i < list.length; i += 1) {
         var id = list[i];
 
