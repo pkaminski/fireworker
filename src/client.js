@@ -787,7 +787,7 @@ class FirebaseWorker {
     // callbacks in flight from the worker to be invoked while the off() is processing, but we don't
     // want them to throw an exception either.
     for (let id of idsToDeregister) this._nullifyCallback(id);
-    return this._send({msg: 'off', url, terms, eventType, callbackId}).then(() => {
+    return this._send({msg: 'off', listenerKey, url, terms, eventType, callbackId}).then(() => {
       for (let id of idsToDeregister) this._deregisterCallback(id);
     });
   }
