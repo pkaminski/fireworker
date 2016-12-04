@@ -626,8 +626,10 @@ FirebaseWorker.prototype._simulateCall = function _simulateCall (props) {
   var simulatedCalls = [];
   switch (props.msg) {
     case 'set':
-    case 'update':
       simulatedCalls.push({method: 'set', url: props.url, args: [props.value]});
+      break;
+    case 'update':
+      simulatedCalls.push({method: 'update', url: props.url, args: [props.value]});
       break;
     case 'on':
     case 'once':
