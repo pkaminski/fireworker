@@ -580,7 +580,7 @@ FirebaseWorker.prototype._receiveMessages = function _receiveMessages (messages)
 
 FirebaseWorker.prototype.bindExposedFunction = function bindExposedFunction (name) {
   return (function() {
-    return this._send({msg: 'call', name: name, args: Array.prototype.slice(arguments)});
+    return this._send({msg: 'call', name: name, args: Array.prototype.slice.call(arguments)});
   }).bind(this);
 };
 

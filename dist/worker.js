@@ -499,7 +499,7 @@ function createRef(url, terms, context) {
     }
     return ref;
   } catch (e) {
-    console.error(url, terms, e);
+    e.extra = {url: url, terms: terms, context: context};
     throw e;
   }
 }
