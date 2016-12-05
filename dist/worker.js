@@ -278,6 +278,7 @@ Fireworker.prototype.on = function on (ref) {
   snapshotCallback.cancel = this.off.bind(this, {listenerKey: listenerKey, url: url, terms: terms, eventType: eventType, callbackId: callbackId});
   var cancelCallback = this._onCancelCallback.bind(this, callbackId);
   createRef(url, terms).on(eventType, snapshotCallback, cancelCallback);
+  options.skipCurrent = false;
 };
 
 Fireworker.prototype.off = function off (ref) {
@@ -309,6 +310,7 @@ Fireworker.prototype.off = function off (ref) {
 };
 
 Fireworker.prototype._onSnapshotCallback = function _onSnapshotCallback (callbackId, options, snapshot) {
+  if (options.skipCurrent || options.skipCallback) { return; }
   this._send({
     msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
   });

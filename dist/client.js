@@ -167,8 +167,10 @@ Query.prototype.on = function on (eventType, callback, cancelCallback, context) 
     cancelCallback = undefined;
   }
   worker.on(
-    this.toString(), this._url, this._terms, eventType, callback, cancelCallback, context,
-    {omitValue: !!callback.omitSnapshotValue}
+    this.toString(), this._url, this._terms, eventType, callback, cancelCallback, context, {
+      omitValue: !!callback.omitSnapshotValue, skipCurrent: !!callback.skipCurrent,
+      skipCallback: !!callback.skipCallback
+    }
   );
   return callback;
 };
@@ -552,13 +554,11 @@ FirebaseWorker.prototype._send = function _send (message) {
 };
 
 FirebaseWorker.prototype._flushMessageQueue = function _flushMessageQueue () {
-  // console.log('send', this._outboundMessages);
   this._port.postMessage(this._outboundMessages);
   this._outboundMessages = [];
 };
 
 FirebaseWorker.prototype._receive = function _receive (event) {
-  // console.log('receive', event.data);
   if (this._active) {
     this._receiveMessages(event.data);
   } else {

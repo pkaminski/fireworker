@@ -1,6 +1,6 @@
 {
   "name": "fireworker",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Firebase in web workers",
   "scripts": {
     "setup": "rm -rf bower_components; rm -rf node_modules; npm install; bower install;"
