@@ -61,7 +61,8 @@ You don't need to do anything special on the worker side.
 
 ## Differences
 
-- Some methods that used to have an immediate effect (e.g., `off` or `unauth`) are now async and return a promise.
+- While writes are still applied optimistically (before the server has acknowledged them), the `on('value')` callbacks are invoked _asynchronously_.  This can throw off some code that relies on the callbacks being synchronous, e.g. to distinguish between local and remote updates.
+- Some methods that used to have an immediate effect (e.g., `off` or `unauth`) are now async and return a promise.  You can use `onError` (below) to make sure you don't miss any errors without having to audit your code for these calls and adding a `.catch()` to each one.
 - Some exceptions that would normally be thrown synchronously (e.g., bad URL, bad combination of query methods) will make an operation fail asynchronously instead.  This should only affect development, and just means that you should always specify an error / failure callback (or catch a promise rejection).
 - `goOffline` will only prevent the client from communicating with the worker, preventing any reads and writes from being executed until `goOnline` is invoked.  Unlike in normal Firebase writes _will not_ be applied locally while "offline", and the connection to Firebase will not be closed.  If needed, you can call `goOffline` from within the worker for the original semantics (affecting all clients), or use `Firebase.bounceConnection()` to execute a `goOffline()` / `goOnline()` pair that will force Firebase to reconnect to the server.
 - `enableLogging` can only be called from within the worker.
