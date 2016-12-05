@@ -547,7 +547,7 @@ class FirebaseWorker {
 
   bindExposedFunction(name) {
     return (function() {
-      return this._send({msg: 'call', name, args: Array.prototype.slice(arguments)});
+      return this._send({msg: 'call', name, args: Array.prototype.slice.call(arguments)});
     }).bind(this);
   }
 
