@@ -221,6 +221,7 @@ class Fireworker {
     snapshotCallback.cancel = this.off.bind(this, {listenerKey, url, terms, eventType, callbackId});
     const cancelCallback = this._onCancelCallback.bind(this, callbackId);
     createRef(url, terms).on(eventType, snapshotCallback, cancelCallback);
+    options.skipCurrent = false;
   }
 
   off({listenerKey, url, terms, eventType, callbackId}) {
@@ -243,6 +244,7 @@ class Fireworker {
   }
 
   _onSnapshotCallback(callbackId, options, snapshot) {
+    if (options.skipCurrent || options.skipCallback) return;
     this._send({
       msg: 'callback', id: callbackId, args: [null, snapshotToJson(snapshot, options)]
     });

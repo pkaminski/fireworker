@@ -157,8 +157,10 @@ class Query {
       cancelCallback = undefined;
     }
     worker.on(
-      this.toString(), this._url, this._terms, eventType, callback, cancelCallback, context,
-      {omitValue: !!callback.omitSnapshotValue}
+      this.toString(), this._url, this._terms, eventType, callback, cancelCallback, context, {
+        omitValue: !!callback.omitSnapshotValue, skipCurrent: !!callback.skipCurrent,
+        skipCallback: !!callback.skipCallback
+      }
     );
     return callback;
   }
@@ -523,13 +525,11 @@ class FirebaseWorker {
   }
 
   _flushMessageQueue() {
-    // console.log('send', this._outboundMessages);
     this._port.postMessage(this._outboundMessages);
     this._outboundMessages = [];
   }
 
   _receive(event) {
-    // console.log('receive', event.data);
     if (this._active) {
       this._receiveMessages(event.data);
     } else {

@@ -73,6 +73,8 @@ You don't need to do anything special on the worker side.
 ### Snapshot control
 For `on` and `once`, you can set extra flags on the callback function:
   - `omitSnapshotValue`: if truthy, the actual snapshot value won't be materialized and transmitted from the worker to the client.  Your callback (or promise, for `once`) will still get a snapshot, but calling methods that rely on the value &mdash; like `val` or `forEach` &mdash; will throw an exception.
+And these flags are only applicable to `on`:
+  - `skipCurrent`: if truthy, your callback won't be invoked for any currently cached values, only for values that arrive from the server in the future.
   - `skipCallback`: if truthy, your callback won't be invoked at all &mdash; this is useful for keeping a value synced for the benefit of other transient listeners without the overhead of creating and transmitting snapshots to the client.
 
 ### Transaction tweaks
