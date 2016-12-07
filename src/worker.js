@@ -451,7 +451,7 @@ function _hashJson(json, sha1) {
       sha1.update('}');
       break;
     default:
-      throw new Error('Unable to hash non-JSON data: ' + type);
+      throw new Error(`Unable to hash non-JSON data of type ${type}: ${json}`);
   }
 }
 
