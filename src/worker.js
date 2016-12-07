@@ -139,6 +139,7 @@ class Fireworker {
       promise = Promise.reject(e);
     }
     if (!message.oneWay) {
+      this._send({msg: 'acknowledge', id: message.id});
       promise.then(result => {
         this._send({msg: 'resolve', id: message.id, result: result});
       }, error => {

@@ -5,6 +5,7 @@ Firebase in a web worker
 
 - Only supports Firebase SDK 2.4.2.  Could probably be adapted to SDK 3.x but it's going to be harder since the source code is not available.
 - Interactive authentication methods don't work; calling `authWithPassword`, `authWithOAuthPopup`, or `authWithOAuthRedirect` will throw an exception.  Instead, use your own server for login and call `authWithCustomToken`.
+- While writes are still applied optimistically (before the server has acknowledged them), the `on('value')` callbacks are invoked _asynchronously_.  This can throw off some code that relies on the callbacks being synchronous, e.g. to distinguish between local and remote updates, and will generally decrease UI responsiveness due to the overhead of message transmission to and from the worker.
 - Item priority is not currently implemented.  Because priority is stored out of band it's difficult to support efficiently, and Firebase folks have indicated that it's essentially deprecated anyway.
 
 
@@ -61,7 +62,6 @@ You don't need to do anything special on the worker side.
 
 ## Differences
 
-- While writes are still applied optimistically (before the server has acknowledged them), the `on('value')` callbacks are invoked _asynchronously_.  This can throw off some code that relies on the callbacks being synchronous, e.g. to distinguish between local and remote updates.
 - Some methods that used to have an immediate effect (e.g., `off` or `unauth`) are now async and return a promise.  You can use `onError` (below) to make sure you don't miss any errors without having to audit your code for these calls and adding a `.catch()` to each one.
 - Some exceptions that would normally be thrown synchronously (e.g., bad URL, bad combination of query methods) will make an operation fail asynchronously instead.  This should only affect development, and just means that you should always specify an error / failure callback (or catch a promise rejection).
 - `goOffline` will only prevent the client from communicating with the worker, preventing any reads and writes from being executed until `goOnline` is invoked.  Unlike in normal Firebase writes _will not_ be applied locally while "offline", and the connection to Firebase will not be closed.  If needed, you can call `goOffline` from within the worker for the original semantics (affecting all clients), or use `Firebase.bounceConnection()` to execute a `goOffline()` / `goOnline()` pair that will force Firebase to reconnect to the server.
@@ -96,6 +96,11 @@ The callback will be invoked with three arguments:
 - `outstandingCount`, the current number of outstanding slow operations (for the given timeout).
 - `delta`, which indicates whether the count just increased or decreased with +1 and -1 respectively.
 - `timeout`, the timeout value specified for this handler.
+
+### Tracking message sending delays
+Every promise has a `sent` property that holds another promise, which will be resolved once the operation has been delegated to Firebase in the worker, and any optimistic updates received and `on` callbacks executed client-side.
+
+You can also use `Firebase.onUnsent` and `Firebase.offUnsent` to track delays in getting a message through to the worker.  (These delays _don't_ include the time needed to process optimistic update callbacks.)  The signatures are the same as for `onSlow` above.
 
 ### Permission denied debugging
 You can have any operations that failed due to a permission denied error retried automatically to provide more details about which security rule failed.  The details are attached to the `error` as `error.extra.debug`.  You'll need to have a server to issue a special short-term auth token with the `simulated` and `debug` flags set.  To set this up, call `Firebase.debugPermissionDeniedErrors(simulatedTokenGenerator, maxSimulationDuration, callFilter)` with:
