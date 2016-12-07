@@ -161,6 +161,7 @@ Fireworker.prototype._receiveMessage = function _receiveMessage (message) {
     promise = Promise.reject(e);
   }
   if (!message.oneWay) {
+    this._send({msg: 'acknowledge', id: message.id});
     promise.then(function (result) {
       this$1._send({msg: 'resolve', id: message.id, result: result});
     }, function (error) {

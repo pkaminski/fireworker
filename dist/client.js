@@ -6,9 +6,16 @@
 var worker;
 var errorCallbacks = [];
 var slowCallbacks = {read: [], write: [], auth: [], onDisconnect: []};
+var unsentCallbacks = {read: [], write: [], auth: [], onDisconnect: []};
 
 var ALPHABET = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
 var MIN_INT32 = 1 << 31, MAX_INT32 = -(1 << 31) - 1;
+
+var MESSAGE_KINDS = {
+  authWithCustomToken: 'auth', authAnonymously: 'auth', authWithOAuthToken: 'auth',
+  set: 'write', update: 'write', transaction: 'write', on: 'read', once: 'read',
+  onDisconnect: 'onDisconnect'
+};
 
 
 var Snapshot = function Snapshot(ref) {
@@ -407,28 +414,19 @@ var Firebase = (function (Query) {
   };
 
   Firebase.onSlow = function onSlow (operationKind, timeout, callback) {
-    var kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
-    for (var i = 0, list = kinds; i < list.length; i += 1) {
-      var kind = list[i];
-
-      slowCallbacks[kind].push({timeout: timeout, callback: callback, count: 0});
-    }
-    return callback;
+    return onTimeoutCallback(slowCallbacks, operationKind, timeout, callback);
   };
 
   Firebase.offSlow = function offSlow (operationKind, callback) {
-    var kinds = operationKind === 'all' ? Object.keys(slowCallbacks) : [operationKind];
-    for (var i$1 = 0, list = kinds; i$1 < list.length; i$1 += 1) {
-      var kind = list[i$1];
+    return offTimeoutCallback(slowCallbacks, operationKind, callback);
+  };
 
-      var records = slowCallbacks[kind];
-      for (var i = 0; i < records.length; i++) {
-        if (records[i].callback === callback) {
-          records.splice(i, 1);
-          break;
-        }
-      }
-    }
+  Firebase.onUnsent = function onUnsent (operationKind, timeout, callback) {
+    return onTimeoutCallback(unsentCallbacks, operationKind, timeout, callback);
+  };
+
+  Firebase.offUnsent = function offUnsent (operationKind, callback) {
+    return offTimeoutCallback(unsentCallbacks, operationKind, callback);
   };
 
   Firebase.debugPermissionDeniedErrors = function debugPermissionDeniedErrors (simulatedTokenGenerator, maxSimulationDuration, callFilter) {
@@ -542,12 +540,21 @@ FirebaseWorker.prototype._send = function _send (message) {
     var this$1 = this;
 
   message.id = ++this._idCounter;
-  var promise = new Promise(function (resolve, reject) {
-    this$1._deferreds[message.id] = {resolve: resolve, reject: reject};
-  });
-  var deferred = this._deferreds[message.id];
-  deferred.promise = promise;
-  for (var name in message) { if (message.hasOwnProperty(name)) { deferred[name] = message[name]; } }
+  var promise;
+  if (message.oneWay) {
+    promise = Promise.resolve();
+  } else {
+    promise = new Promise(function (resolve, reject) {
+      this$1._deferreds[message.id] = {resolve: resolve, reject: reject};
+    });
+    var deferred = this._deferreds[message.id];
+    deferred.promise = promise;
+    promise.sent = new Promise(function (resolve) {
+      deferred.resolveSent = resolve;
+    });
+    trackUnsent(deferred, MESSAGE_KINDS[message.msg]);
+    for (var name in message) { if (message.hasOwnProperty(name)) { deferred[name] = message[name]; } }
+  }
   if (!this._outboundMessages.length && this._active) { setImmediate(this._flushMessageQueue); }
   this._outboundMessages.push(message);
   return promise;
@@ -559,6 +566,16 @@ FirebaseWorker.prototype._flushMessageQueue = function _flushMessageQueue () {
 };
 
 FirebaseWorker.prototype._receive = function _receive (event) {
+    var this$1 = this;
+
+  for (var i = 0, list = event.data; i < list.length; i += 1) {
+    var message = list[i];
+
+      if (message.msg === 'acknowledge') {
+      var deferred = this$1._deferreds[message.id];
+      if (deferred && deferred.acknowledge) { deferred.acknowledge(message); }
+    }
+  }
   if (this._active) {
     this._receiveMessages(event.data);
   } else {
@@ -582,6 +599,12 @@ FirebaseWorker.prototype.bindExposedFunction = function bindExposedFunction (nam
   return (function() {
     return this._send({msg: 'call', name: name, args: Array.prototype.slice.call(arguments)});
   }).bind(this);
+};
+
+FirebaseWorker.prototype.acknowledge = function acknowledge (message) {
+  var deferred = this._deferreds[message.id];
+  if (!deferred) { throw new Error('fireworker received acknowledgement of inexistent call'); }
+  if (deferred.resolveSent) { deferred.resolveSent(); }
 };
 
 FirebaseWorker.prototype.resolve = function resolve (message) {
@@ -950,6 +973,31 @@ function attachCallback(promise, onComplete, operationKind) {
   );
 }
 
+function onTimeoutCallback(collection, operationKind, timeout, callback) {
+  var kinds = operationKind === 'all' ? Object.keys(collection) : [operationKind];
+  for (var i = 0, list = kinds; i < list.length; i += 1) {
+    var kind = list[i];
+
+    collection[kind].push({timeout: timeout, callback: callback, count: 0});
+  }
+  return callback;
+}
+
+function offTimeoutCallback(collection, operationKind, callback) {
+  var kinds = operationKind === 'all' ? Object.keys(collection) : [operationKind];
+  for (var i$1 = 0, list = kinds; i$1 < list.length; i$1 += 1) {
+    var kind = list[i$1];
+
+    var records = collection[kind];
+    for (var i = 0; i < records.length; i++) {
+      if (records[i].callback === callback) {
+        records.splice(i, 1);
+        break;
+      }
+    }
+  }
+}
+
 function trackSlowness(promise, operationKind) {
   var records = slowCallbacks[operationKind];
   if (!records.length) { return promise; }
@@ -973,6 +1021,19 @@ function trackSlowness(promise, operationKind) {
   });
 
   return promise;
+}
+
+function trackUnsent(deferred, operationKind) {
+  var records = unsentCallbacks[operationKind];
+  if (!(records && records.length)) { return; }
+  var timeouts = records.map(function (record) { return new SlownessTracker(record); });
+  deferred.acknowledge = function(message) {
+    for (var i = 0, list = timeouts; i < list.length; i += 1) {
+      var timeout = list[i];
+
+      timeout.handleDone();
+    }
+  };
 }
 
 function errorFromJson(json) {
