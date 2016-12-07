@@ -977,10 +977,15 @@ function trackSlowness(promise, operationKind) {
 
 function errorFromJson(json) {
   if (!json || json instanceof Error) { return json; }
-  var error = new Error();
+  var error = new Error(json.message);
   for (var propertyName in json) {
-    if (!json.hasOwnProperty(propertyName)) { continue; }
-    error[propertyName] = json[propertyName];
+    if (propertyName === 'message' || !json.hasOwnProperty(propertyName)) { continue; }
+    try {
+      error[propertyName] = json[propertyName];
+    } catch (e) {
+      e.extra = {propertyName: propertyName};
+      throw e;
+    }
   }
   return error;
 }
