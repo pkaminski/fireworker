@@ -910,10 +910,15 @@ function trackSlowness(promise, operationKind) {
 
 function errorFromJson(json) {
   if (!json || json instanceof Error) return json;
-  const error = new Error();
+  const error = new Error(json.message);
   for (let propertyName in json) {
-    if (!json.hasOwnProperty(propertyName)) continue;
-    error[propertyName] = json[propertyName];
+    if (propertyName === 'message' || !json.hasOwnProperty(propertyName)) continue;
+    try {
+      error[propertyName] = json[propertyName];
+    } catch (e) {
+      e.extra = {propertyName};
+      throw e;
+    }
   }
   return error;
 }
